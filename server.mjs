@@ -7,6 +7,9 @@
 //   增: session_create（落 session 行，复刻 ensureSessionPersisted 语义）/ session_run（跑一个新会话）
 //   改: session_rename / session_pin / session_archive / session_model / session_send
 //   删: session_delete（默认软删=tasks-index tombstone；hard=true 真删，FK/显式级联）
+// 额度面: plan_quota（apiKey 额度）/ plan_start（start plan 套餐+余额）/ plan_reset_card（重置卡）
+//         / plan_claim（领取面）/ plan_switch（切 current key）——zcode.z.ai 账号端点+凭据
+//         解密对齐桌面端 app.asar（credentialService enc:v1 AES-256-GCM）
 // 数据层（源码事实层/索引层，均为 WAL 多进程共享）:
 //   ~/.zcode/cli/db/db.sqlite          session/message/part/session_entry/usage 等会话事实
 //   ~/.zcode/v2/tasks-index.sqlite     侧栏组织态（pinned/archived/deleted/meta_json）+ automations
@@ -22,13 +25,13 @@
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform, userInfo } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, createDecipheriv } from "node:crypto";
 import process from "node:process";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const DB_TASKS_TIMEOUT_MS = 5000;
 // scheduler 每 20s 轮询 automations（packages/desktop/src/scheduler）；misfire 宽限 5 分钟，
 // 插行的 next_run_at 必须 ≈ now，否则被判"错过窗口"直接跳过。
@@ -44,6 +47,11 @@ const ARTIFACTS_DIR = join(ZCODE_HOME, "cli", "artifacts");
 const V2_CONFIG = join(ZCODE_HOME, "v2", "config.json");
 const CONFIG_PATH = process.env.ZCODE_SESSION_CONFIG || join(SCRIPT_DIR, "session.json");
 const QUOTA_BASE = process.env.ZCODE_SESSION_QUOTA_BASE || "https://open.bigmodel.cn/api/monitor/usage";
+// ZCode 账号面（start plan / 重置卡 / 领取）——端点与请求形状对齐桌面端 app.asar（usage-stats + codingPlanSubscription 模块）
+const ZCODE_PLAN_BASE = process.env.ZCODE_SESSION_PLAN_BASE || "https://zcode.z.ai";
+const ZCODE_APP_VERSION = process.env.ZCODE_SESSION_APP_VERSION || "3.14.4"; // 服务端校验该参数，须用客户端在发版本
+const CREDENTIALS_FILE = join(ZCODE_HOME, "v2", "credentials.json");
+const TELEMETRY_STATE = join(ZCODE_HOME, "v2", "telemetry-state.json");
 const ZCODE_CJS = process.env.ZCODE_SESSION_CLI || "E:\\zcode\\resources\\glm\\zcode.cjs";
 const NODE_EXE = process.env.ZCODE_SESSION_NODE || process.execPath;
 const DEFAULT_CWD = join(ZCODE_HOME, "workspace");
@@ -1462,6 +1470,361 @@ async function planQuota(args) {
   }
 }
 
+// ---------------------------------------------------------------- ZCode 账号面凭据（start plan / 重置卡）
+
+// 凭据解密与客户端同源：app.asar credentialService（enc:v1:{iv}.{tag}.{ct}，AES-256-GCM，
+// key = sha256(ZCODE_CREDENTIAL_SECRET || "zcode-credential-fallback:{platform}:{homedir}:{username}")）
+function zcodeCredentialDecrypt(value) {
+  const PREFIX = "enc:v1:";
+  if (typeof value !== "string" || !value.startsWith(PREFIX)) return value;
+  let username = "unknown";
+  try { username = userInfo().username; } catch { /* 客户端同款兜底 */ }
+  const secret = process.env.ZCODE_CREDENTIAL_SECRET
+    || `zcode-credential-fallback:${platform()}:${homedir()}:${username}`;
+  const key = createHash("sha256").update(secret).digest();
+  const [ivB, tagB, ctB] = value.slice(PREFIX.length).split(".");
+  if (!ivB || !tagB || !ctB) throw new Error("凭据密文格式非法");
+  const d = createDecipheriv("aes-256-gcm", key, Buffer.from(ivB, "base64url"));
+  d.setAuthTag(Buffer.from(tagB, "base64url"));
+  return Buffer.concat([d.update(Buffer.from(ctB, "base64url")), d.final()]).toString("utf8");
+}
+
+function loadZcodeAccountCredentials() {
+  if (!existsSync(CREDENTIALS_FILE)) {
+    return { error: errResult("CREDENTIALS_NOT_FOUND",
+      `未找到 ${CREDENTIALS_FILE}。start plan/重置卡/领取凭据由 ZCode 桌面端登录后写入；请先在桌面端登录 bigmodel 账号。`) };
+  }
+  let store;
+  try { store = JSON.parse(readFileSync(CREDENTIALS_FILE, "utf8")); }
+  catch (e) { return { error: errResult("CREDENTIALS_PARSE_FAILED", errText(e)) }; }
+  let out;
+  try {
+    out = {
+      zcodeJwt: store["zcodejwttoken"] ? zcodeCredentialDecrypt(store["zcodejwttoken"]) : "",
+      maasJwt: store["oauth:bigmodel:access_token"] ? zcodeCredentialDecrypt(store["oauth:bigmodel:access_token"]) : "",
+      activeProvider: store["oauth:active_provider"] ? zcodeCredentialDecrypt(store["oauth:active_provider"]) : "",
+    };
+  } catch (e) {
+    return { error: errResult("CREDENTIALS_DECRYPT_FAILED",
+      `凭据解密失败（桌面端登录过期或 ZCODE_CREDENTIAL_SECRET 非默认值？）: ${errText(e)}`) };
+  }
+  if (!out.zcodeJwt) return { error: errResult("CREDENTIALS_INCOMPLETE", "credentials.json 缺少 zcodejwttoken（桌面端未登录 bigmodel 账号）。") };
+  return { creds: out };
+}
+
+// 客户端全局源码头（buildZCodeSourceHeadersFromContext 同款）；balance/preview 对此校验，缺了返回 3001
+function zcodeSourceHeaders() {
+  const osName = platform() === "win32" ? "windows" : platform();
+  const arch = process.arch === "x64" ? "x86_64" : process.arch;
+  let tz = "Asia/Shanghai";
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz; } catch { /* noop */ }
+  const headers = {
+    "User-Agent": `ZCode/${ZCODE_APP_VERSION}`,
+    "X-ZCode-App-Version": ZCODE_APP_VERSION,
+    "X-Title": "Z Code@electron",
+    "X-Platform": `${osName}-${arch}`,
+    "HTTP-Referer": ZCODE_PLAN_BASE,
+    "X-Client-Language": "zh-CN",
+    "X-Client-Timezone": tz,
+    "X-Os-Category": osName,
+  };
+  try {
+    const t = JSON.parse(readFileSync(TELEMETRY_STATE, "utf8"));
+    if (t && typeof t.deviceMid === "string" && t.deviceMid) headers["X-Device-Mid"] = t.deviceMid;
+  } catch { /* 无 telemetry-state 则不发设备号 */ }
+  return headers;
+}
+
+// zcode.z.ai 信封调用：{code, msg, data}，code=0 为成功；acceptedCodes 用于业务码放行（如机会未中 3301）
+async function zcodePlanApi(pathname, { method = "GET", query = {}, headers = {}, body = null, acceptedCodes = [], timeoutMs = 15000 } = {}) {
+  const url = new URL(pathname, ZCODE_PLAN_BASE + "/");
+  for (const [k, v] of Object.entries(query)) url.searchParams.set(k, String(v));
+  let res, json;
+  try {
+    res = await fetchWithTimeout(url.toString(), {
+      method,
+      headers,
+      ...(body !== null ? { body: JSON.stringify(body) } : {}),
+    }, timeoutMs);
+    json = await res.json();
+  } catch (e) {
+    throw new Error(`请求 ${pathname} 失败: ${errText(e)}`);
+  }
+  if (json && typeof json.code === "number" && json.code !== 0 && !acceptedCodes.includes(json.code)) {
+    const err = new Error(`业务错误 code=${json.code}${json.msg ? " " + json.msg : ""} (HTTP ${res.status})`);
+    err.businessCode = json.code;
+    err.businessMsg = json.msg || "";
+    throw err;
+  }
+  return { httpStatus: res.status, json };
+}
+
+function unitsFormat(n) {
+  if (!Number.isFinite(n)) return "?";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+
+function isoFromEpochSec(sec) {
+  return Number.isFinite(sec) && sec > 0 ? new Date(sec * 1000).toISOString() : null;
+}
+
+async function planStartView() {
+  const auth = loadZcodeAccountCredentials();
+  if (auth.error) return auth.error;
+  const { zcodeJwt, activeProvider } = auth.creds;
+  const headers = { ...zcodeSourceHeaders(), Authorization: `Bearer ${zcodeJwt}` };
+  const q = { app_version: ZCODE_APP_VERSION };
+
+  let current = null, balance = null, preview = null;
+  const errs = {};
+  const grab = (key, path, extraQuery) => zcodePlanApi(path, { headers, query: { ...q, ...extraQuery } })
+    .then((r) => { if (key === "balance") balance = r.json; else if (key === "current") current = r.json; else preview = r.json; })
+    .catch((e) => { errs[key] = errText(e); });
+  await Promise.all([
+    grab("current", "/api/v1/zcode-plan/billing/current"),
+    grab("balance", "/api/v1/zcode-plan/billing/balance"),
+    grab("preview", "/api/v1/zcode-plan/billing/preview", { platform: zcodeSourceHeaders()["X-Platform"] }),
+  ]);
+  if (!balance && !current) {
+    return errResult("PLAN_API_FAILED", `start plan 接口全部失败（401/过期请先在桌面端重新登录 bigmodel 账号）`, { errors: errs });
+  }
+
+  const plans = (balance || current)?.data?.plans || [];
+  const balances = (balance?.data?.balances || []).map((b) => ({
+    model: b.show_name || null, capabilities: b.capabilities || [],
+    total: b.total_units ?? null, used: b.used_units ?? null, remaining: b.remaining_units ?? null,
+    percentage: (Number.isFinite(b.total_units) && b.total_units > 0 && Number.isFinite(b.remaining_units))
+      ? Math.round((b.remaining_units / b.total_units) * 1000) / 10 : null,
+    expiresAt: isoFromEpochSec(b.expires_at ?? b.period_end),
+  }));
+  const activePlans = plans.filter((p) => String(p.status || "").toLowerCase() === "active");
+  const nextExpire = activePlans.map((p) => Number(p.ends_at)).filter((n) => n > 0).sort((a, b) => a - b)[0];
+  const claimable = (preview?.data?.plans || []).map((p) => ({ plan_id: p.plan_id, name: p.name, description: p.description ?? null, subtitle: p.subtitle ?? null }));
+  const remainingSum = balances.reduce((s, b) => s + (b.remaining || 0), 0);
+
+  return okResult({
+    ok: true, activeProvider: activeProvider || null,
+    plans: plans.map((p) => ({
+      plan_id: p.plan_id, name: p.name, status: p.status, priority: p.priority,
+      startsAt: isoFromEpochSec(p.starts_at), endsAt: isoFromEpochSec(p.ends_at),
+      entitlements: (p.entitlements || []).map((e) => ({ show_name: e.show_name, grant_units: e.grant_units, period: e.period, capabilities: e.capabilities || [] })),
+    })),
+    balances, claimablePlans: claimable,
+    errors: Object.keys(errs).length ? errs : undefined,
+    fetchedAt: new Date().toISOString(),
+    summary: `start plan（${activeProvider || "bigmodel"}）：${activePlans.map((p) => p.name).join("、") || "无 active 套餐"}`
+      + (balances.length ? `；余额 ${balances.map((b) => `${b.model} 剩${unitsFormat(b.remaining)}/${unitsFormat(b.total)}(${b.percentage ?? "?"}%)`).join("、")}`
+        + (nextExpire ? `，最早 ${new Date(nextExpire * 1000).toISOString()} 到期` : "")
+        : remainingSum === 0 ? "；余额桶为空/已耗尽" : "")
+      + (claimable.length ? `；⚠ 有 ${claimable.length} 个可领取套餐（plan_claim 查看详情；领取需过人机验证）` : "；当前无可领取套餐"),
+  });
+}
+
+// ---------------------------------------------------------------- 重置卡（coding-plan reset）
+
+const RESET_BASE = "/api/v1/coding-plan/reset";
+const RESET_TYPES = ["FIVE_HOUR", "WEEK"];
+
+async function planResetCard(args) {
+  const action = String(args.action || "status").toLowerCase();
+  const auth = loadZcodeAccountCredentials();
+  if (auth.error) return auth.error;
+  const { zcodeJwt, maasJwt, activeProvider } = auth.creds;
+  if (!maasJwt) return errResult("CREDENTIALS_INCOMPLETE", "credentials.json 缺少 oauth:bigmodel:access_token（重置卡需要双令牌）。");
+  if (activeProvider && activeProvider !== "bigmodel") {
+    return errResult("UNSUPPORTED_FAMILY", `当前 active provider 为 ${activeProvider}，本工具仅实现了 bigmodel 家族（zai 家族需 oauth:zai:access_token）。`);
+  }
+  // 双令牌头 + 目标类型（ow/createCodingPlanResetHeaders 同款；个人版不带 org/project）
+  const headers = {
+    ...zcodeSourceHeaders(),
+    "Authorization": `Bearer ${zcodeJwt}`,
+    "X-Bigmodel-Authorization": maasJwt,
+    "Bigmodel-Target-Type": "PERSONAL",
+  };
+
+  const readStatus = async () => {
+    const r = await zcodePlanApi(RESET_BASE + "/status", { headers });
+    const d = r.json.data || {};
+    const five = (d.available_five_hour_resets || []).map((x) => x.expire_at).filter(Number.isFinite);
+    const week = (d.available_week_resets || []).map((x) => x.expire_at).filter(Number.isFinite);
+    return {
+      availableFiveHourResets: { count: five.length, earliestExpireAt: five.length ? new Date(Math.min(...five)).toISOString() : null },
+      availableWeekResets: { count: week.length, earliestExpireAt: week.length ? new Date(Math.min(...week)).toISOString() : null },
+      latestFiveHourResetUsedAt: d.latest_five_hour_reset_history ? new Date(d.latest_five_hour_reset_history.used_at).toISOString() : null,
+      latestWeekResetUsedAt: d.latest_week_reset_history ? new Date(d.latest_week_reset_history.used_at).toISOString() : null,
+      hasUnreadHistory: Boolean(d.has_unread_history),
+    };
+  };
+
+  if (action === "status") {
+    try {
+      const st = await readStatus();
+      return okResult({ ok: true, action, ...st, fetchedAt: new Date().toISOString(),
+        summary: `重置卡：5小时窗 ${st.availableFiveHourResets.count} 张${st.availableFiveHourResets.earliestExpireAt ? `（最早 ${st.availableFiveHourResets.earliestExpireAt} 到期）` : ""}，周窗 ${st.availableWeekResets.count} 张。` });
+    } catch (e) { return errResult("RESET_STATUS_FAILED", errText(e)); }
+  }
+
+  if (action === "use") {
+    if (!args.confirm) {
+      let inventory = null;
+      try { inventory = await readStatus(); } catch { /* 预览失败不阻塞确认门 */ }
+      return errResult("RESET_USE_REQUIRES_CONFIRM",
+        `use 会真实消费一张重置卡并立即重置对应额度窗口（不可撤销）。确认后带 confirm=true 重试。`
+        + (inventory ? ` 当前库存：5小时窗 ${inventory.availableFiveHourResets.count} 张，周窗 ${inventory.availableWeekResets.count} 张。` : ""),
+        { inventory: inventory || undefined });
+    }
+    const resetType = String(args.resetType || "FIVE_HOUR").toUpperCase();
+    if (!RESET_TYPES.includes(resetType)) return errResult("BAD_ARGS", `resetType 只支持 ${RESET_TYPES.join(" | ")}（收到 ${args.resetType}）`);
+    const idempotencyKey = String(args.idempotencyKey || randomUUID()).slice(0, 64);
+    let before = null;
+    try { before = await readStatus(); } catch { /* noop */ }
+    try {
+      await zcodePlanApi(RESET_BASE + "/use", {
+        method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+        body: { idempotency_key: idempotencyKey, reset_type: resetType },
+      });
+    } catch (e) {
+      const hint = e.businessCode ? `（业务码 ${e.businessCode}：常见于窗口未耗尽时不允许重置/卡已过期）` : "";
+      return errResult("RESET_USE_FAILED", errText(e) + hint, { resetType, idempotencyKey });
+    }
+    let after = null;
+    try { after = await readStatus(); } catch { /* noop */ }
+    return okResult({
+      ok: true, action: "use", resetType, idempotencyKey, usedAt: new Date().toISOString(),
+      before, after,
+      note: "重置卡已消费：对应窗口额度即刻恢复（以 after 为准复核）。幂等键可防重复提交。",
+    });
+  }
+
+  if (action === "opportunity") {
+    // 客户端 coding-plan-reset coordinator 会自动轮询该端点攒卡；此处仅手动触发一次，勿做循环
+    const idempotencyKey = String(args.idempotencyKey || randomUUID()).slice(0, 64);
+    try {
+      const r = await zcodePlanApi(RESET_BASE + "/opportunity", {
+        method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+        body: { idempotency_key: idempotencyKey },
+        acceptedCodes: [3301],
+      });
+      const d = r.json.data || {};
+      const granted = d.granted === true && r.json.code === 0;
+      return okResult({
+        ok: true, action: "opportunity", granted, nextTryAt: d.next_try_at ? new Date(d.next_try_at).toISOString() : null,
+        idempotencyKey,
+        note: granted ? "获得一次重置机会（卡入库，plan_reset_card action=status 查看）。"
+          : "本次未获得（3301=机会未中/冷却中）。客户端会自动轮询，请勿高频重试（429=限流）。",
+      });
+    } catch (e) {
+      const throttled = /429/.test(errText(e));
+      return errResult("RESET_OPPORTUNITY_FAILED", errText(e) + (throttled ? "（被限流：稍后再试，客户端本身也在自动轮询）" : ""));
+    }
+  }
+
+  if (action === "history_read") {
+    try {
+      await zcodePlanApi(RESET_BASE + "/history/read", { method: "POST", headers });
+      return okResult({ ok: true, action: "history_read", note: "已标记重置历史为已读（清除客户端未读提示）。" });
+    } catch (e) { return errResult("RESET_HISTORY_READ_FAILED", errText(e)); }
+  }
+
+  return errResult("BAD_ARGS", `action 只支持 status | use | opportunity | history_read（收到 ${args.action}）`);
+}
+
+// ---------------------------------------------------------------- 领取面（billing preview / claim）
+
+async function planClaim(args) {
+  const action = String(args.action || "preview").toLowerCase();
+  const auth = loadZcodeAccountCredentials();
+  if (auth.error) return auth.error;
+  const { zcodeJwt } = auth.creds;
+  const headers = { ...zcodeSourceHeaders(), Authorization: `Bearer ${zcodeJwt}` };
+
+  if (action === "preview") {
+    try {
+      const r = await zcodePlanApi("/api/v1/zcode-plan/billing/preview", {
+        headers,
+        query: { app_version: ZCODE_APP_VERSION, platform: zcodeSourceHeaders()["X-Platform"] },
+      });
+      const plans = (r.json.data && r.json.data.plans) || [];
+      return okResult({
+        ok: true, action, claimableCount: plans.length,
+        plans: plans.map((p) => ({
+          plan_id: p.plan_id, name: p.name, subtitle: p.subtitle ?? p.description ?? null,
+          manualClaim: p.manual_claim ?? null, priority: p.priority ?? null,
+        })),
+        fetchedAt: new Date().toISOString(),
+        summary: plans.length
+          ? `有 ${plans.length} 个可领取套餐：${plans.map((p) => p.name || p.plan_id).join("、")}。领取需过阿里云人机验证（见 plan_claim action=claim）。`
+          : "当前没有可领取的活动套餐（preview 为空）。",
+      });
+    } catch (e) { return errResult("CLAIM_PREVIEW_FAILED", errText(e)); }
+  }
+
+  if (action === "claim") {
+    const planId = String(args.planId || "").trim();
+    if (!planId) return errResult("BAD_ARGS", "claim 需要 planId（先 action=preview 拿 plan_id）");
+    const captcha = String(args.captchaVerifyParam || "").trim();
+    if (!captcha) {
+      return errResult("CLAIM_CAPTCHA_REQUIRED",
+        "领取强制阿里云人机验证（X-Aliyun-Captcha-Verify-Param），无法全自动。两条路：① 在 ZCode 客户端领取弹窗里完成验证点击领取（最省事）；"
+        + "② 在浏览器登录 zcode.z.ai 完成验证码后，把拿到的 captchaVerifyParam 作为本参数传入重试。claim body={plan_id}，验证码参数有时效。",
+        { planId });
+    }
+    try {
+      const r = await zcodePlanApi("/api/v1/zcode-plan/billing/claim", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json", "X-Aliyun-Captcha-Verify-Param": captcha },
+        body: { plan_id: planId },
+      });
+      const d = r.json.data || {};
+      return okResult({
+        ok: true, action: "claim", planId,
+        claimedPlan: d.plan ? { plan_id: d.plan.plan_id, name: d.plan.name, endsAt: isoFromEpochSec(d.plan.ends_at) } : null,
+        serverMessage: typeof d.message === "string" ? d.message : undefined,
+        note: d.plan ? "领取成功：plan_start 复核新套餐与余额。" : `服务端未返回 plan（code=${r.json.code} ${r.json.msg || ""}），以 plan_start 复核为准。`,
+      });
+    } catch (e) {
+      return errResult("CLAIM_FAILED", errText(e) + (e.businessCode ? "（验证码参数可能已过期，重新获取后重试）" : ""), { planId });
+    }
+  }
+
+  return errResult("BAD_ARGS", `action 只支持 preview | claim（收到 ${args.action}）`);
+}
+
+// ---------------------------------------------------------------- 切换额度 key（session.json current）
+
+function planSwitch(args) {
+  const { config, path } = ensureConfig();
+  const keys = (config && config.keys) || {};
+  const overview = () => Object.entries(keys).map(([alias, k]) => ({
+    keyAlias: alias, plan: k.plan || null, current: Boolean(k.current),
+    apiKeyMasked: k.apiKey ? String(k.apiKey).slice(0, 6) + "…" : null,
+    note: k.note || null,
+  }));
+  if (!args.keyAlias) {
+    const current = Object.keys(keys).find((k) => keys[k] && keys[k].current) || null;
+    return okResult({
+      ok: true, currentKeyAlias: current, keys: overview(),
+      note: "current=plan_quota 默认查询的 key。要切换：plan_switch { keyAlias }。仅影响本 MCP 额度面的默认 key，不改 ZCode 客户端 provider 配置。",
+    });
+  }
+  const alias = String(args.keyAlias);
+  if (!keys[alias]) {
+    return errResult("KEY_NOT_CONFIGURED", `配置中不存在 keyAlias "${alias}"。可用: ${Object.keys(keys).join(", ") || "(无)"}`, { keys: overview() });
+  }
+  if (!keys[alias].apiKey) return errResult("KEY_NOT_CONFIGURED", `keyAlias "${alias}" 的 apiKey 未填写，先编辑 ${path}。`);
+  for (const k of Object.keys(keys)) keys[k].current = k === alias;
+  try {
+    writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf8");
+  } catch (e) { return errResult("SWITCH_WRITE_FAILED", errText(e)); }
+  const mapped = Object.entries((config && config.providerMap) || {}).filter(([, v]) => v === alias).map(([p]) => p);
+  return okResult({
+    ok: true, currentKeyAlias: alias, keys: overview(), providerMapHits: mapped,
+    note: `已切换 current → "${alias}"（plan_quota 缺省即查它）。providerMap 里指向它的 provider：${mapped.join(", ") || "(无)"}。`,
+  });
+}
+
 // ---------------------------------------------------------------- MCP stdio 层
 
 const TOOLS = [
@@ -1654,6 +2017,44 @@ const TOOLS = [
       properties: { keyAlias: { type: "string", description: "session.json keys 里的别名；缺省取 current" } },
     },
   },
+  {
+    name: "plan_start",
+    description: "查看 ZCode start plan 账号面（zcode.z.ai，凭据取自桌面端登录 ~/.zcode/v2/credentials.json）：生效套餐列表、各模型余额桶（total/used/remaining/到期）、当前可领取套餐。View ZCode start-plan subscriptions, balances and claimable plans.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "plan_reset_card",
+    description: "智谱重置卡：action=status 查看库存（5小时窗/周窗各几张、到期时间、最近使用历史）；action=use 消费一张立即重置对应额度窗口（需 confirm=true，resetType=FIVE_HOUR|WEEK，幂等键自动生成）；action=opportunity 手动触发一次领卡机会（客户端本就自动轮询，勿循环调用）；action=history_read 标记历史已读。Coding-plan reset cards: status / use (confirm-gated) / opportunity / history read.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["status", "use", "opportunity", "history_read"], description: "默认 status" },
+        resetType: { type: "string", enum: ["FIVE_HOUR", "WEEK"], description: "use 时必选语义：重置哪个窗口，默认 FIVE_HOUR" },
+        confirm: { type: "boolean", description: "use 时必填 true（真实消费一张卡）" },
+        idempotencyKey: { type: "string", description: "可选幂等键（≤64字符），缺省 UUID" },
+      },
+    },
+  },
+  {
+    name: "plan_claim",
+    description: "start plan 领取面：action=preview 列出当前可领取的活动套餐（可配合定时任务轮询）；action=claim 按 plan_id 领取——服务端强制阿里云人机验证，需传 captchaVerifyParam（客户端弹窗完成验证最省事，无法全自动）。Manual-claim plan preview / claim (captcha-gated).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["preview", "claim"], description: "默认 preview" },
+        planId: { type: "string", description: "claim 时的 plan_id（preview 返回）" },
+        captchaVerifyParam: { type: "string", description: "claim 必填：阿里云验证码 verify 参数（有时效）" },
+      },
+    },
+  },
+  {
+    name: "plan_switch",
+    description: "查看/切换 session.json 额度 keys 的 current（plan_quota 缺省查询的 keyAlias）。无参=列出全部 key 与 current；带 keyAlias=切换。只影响本 MCP 额度面，不改 ZCode 客户端 provider。Switch the default quota key.",
+    inputSchema: {
+      type: "object",
+      properties: { keyAlias: { type: "string", description: "要置为 current 的别名；缺省只列出" } },
+    },
+  },
 ];
 
 function dispatch(name, args) {
@@ -1672,6 +2073,10 @@ function dispatch(name, args) {
     case "session_send": return sessionSend(args || {});
     case "session_model": return Promise.resolve(sessionModelSet(args || {}));
     case "plan_quota": return planQuota(args || {});
+    case "plan_start": return planStartView(args || {});
+    case "plan_reset_card": return planResetCard(args || {});
+    case "plan_claim": return planClaim(args || {});
+    case "plan_switch": return Promise.resolve(planSwitch(args || {}));
     default: return Promise.resolve(errResult("UNKNOWN_TOOL", `未知工具: ${name}（本 server 是 zcode-session-mcp，工具列表见 tools/list）`));
   }
 }

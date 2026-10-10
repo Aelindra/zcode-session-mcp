@@ -1,7 +1,7 @@
 {
   "name": "zcode-session-mcp",
-  "version": "0.1.0",
-  "description": "Session management MCP server for ZCode (zai-org/ZCode): list/search/read/create/rename/pin/archive/delete local sessions, check liveness, run new sessions or send prompts into existing ones. 零依赖,直接读写 ZCode 本地库。",
+  "version": "0.2.0",
+  "description": "Session management MCP server for ZCode (zai-org/ZCode): session CRUD/liveness/run/inject + quota face (start plan view, coding-plan reset cards, manual-claim plans, key switching). 零依赖,直接读写 ZCode 本地库。",
   "license": "MIT",
   "type": "module",
   "main": "server.mjs",
@@ -22,7 +22,8 @@
     "glm",
     "session",
     "session-management",
-    "agent"
+    "agent",
+    "coding-plan"
   ],
   "engines": {
     "node": ">=22.5.0"

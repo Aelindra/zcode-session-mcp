@@ -67,7 +67,7 @@ async function main() {
 
   const tl = await rpc("tools/list", {});
   const names = tl.result.tools.map((t) => t.name);
-  check("tools/list 14个", names.length === 14, names);
+  check("tools/list 18个", names.length === 18, names);
 
   // ---- 只读面（真实数据）
   const list = await call("session_list", { limit: 5 });
@@ -145,6 +145,40 @@ async function main() {
   // ---- 额度（可选能力：有 legacy 配置则真查，没有只验证结构化报错）
   const quota = await call("plan_quota", {});
   check("plan_quota 结构化返回", quota.body && (quota.body.ok || quota.body.error), quota.body);
+
+  // ---- 额度面（start plan / 重置卡 / 领取 / 切 key；凭据缺失时全部结构化报错）
+  const pstart = await call("plan_start", {});
+  check("plan_start 结构化返回", pstart.body && (pstart.body.ok || pstart.body.error), pstart.body);
+  if (pstart.body && pstart.body.ok) {
+    check("plan_start 套餐/余额形状", Array.isArray(pstart.body.plans) && Array.isArray(pstart.body.balances) && typeof pstart.body.summary === "string", pstart.body.summary);
+  }
+
+  const rcStatus = await call("plan_reset_card", { action: "status" });
+  check("plan_reset_card status 结构化", rcStatus.body && (rcStatus.body.ok || rcStatus.body.error), rcStatus.body);
+  if (rcStatus.body && rcStatus.body.ok) {
+    check("plan_reset_card 库存形状", rcStatus.body.availableFiveHourResets && typeof rcStatus.body.availableFiveHourResets.count === "number", rcStatus.body);
+  }
+
+  const rcRefused = await call("plan_reset_card", { action: "use" });
+  check("plan_reset_card use 无 confirm 被拒", rcRefused.isError && rcRefused.body.error.code === "RESET_USE_REQUIRES_CONFIRM", rcRefused.body);
+
+  const rcBad = await call("plan_reset_card", { action: "nonsense" });
+  check("plan_reset_card 非法 action 报 BAD_ARGS", rcBad.isError && rcBad.body.error.code === "BAD_ARGS", rcBad.body);
+
+  const pclaim = await call("plan_claim", { action: "preview" });
+  check("plan_claim preview 结构化", pclaim.body && (pclaim.body.ok || pclaim.body.error), pclaim.body);
+
+  const pclaimNoCaptcha = await call("plan_claim", { action: "claim", planId: "smoke-fake-plan" });
+  check("plan_claim claim 无验证码被拒", pclaimNoCaptcha.isError && pclaimNoCaptcha.body.error.code === "CLAIM_CAPTCHA_REQUIRED", pclaimNoCaptcha.body);
+
+  const pswList = await call("plan_switch", {});
+  check("plan_switch 列表结构化", pswList.body && pswList.body.ok && Array.isArray(pswList.body.keys), pswList.body);
+  if (pswList.body && pswList.body.ok && pswList.body.currentKeyAlias) {
+    const pswBack = await call("plan_switch", { keyAlias: pswList.body.currentKeyAlias });
+    check("plan_switch 切回 current 幂等", pswBack.body && pswBack.body.ok && pswBack.body.currentKeyAlias === pswList.body.currentKeyAlias, pswBack.body);
+  }
+  const pswBad = await call("plan_switch", { keyAlias: "smoke-no-such-key" });
+  check("plan_switch 未知别名报 KEY_NOT_CONFIGURED", pswBad.isError && pswBad.body.error.code === "KEY_NOT_CONFIGURED", pswBad.body);
 
   console.log(process.exitCode ? "\n== 有失败项 ==" : "\n== 全部通过 ==");
   proc.kill();

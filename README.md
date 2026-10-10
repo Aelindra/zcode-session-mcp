@@ -86,7 +86,16 @@ Then register with your MCP client.
 | --- | --- |
 | `session_run` | Start a **new** session with a prompt. Default `native: true` inserts a one-shot row into the desktop scheduler's automations table; the ZCode app (20s polling) picks it up and runs it natively — the session appears live in the sidebar. `native: false` runs the zcode CLI headless. Returns immediately with a `resultPath` you can read later. |
 | `session_send` | Inject a prompt into an **existing** session: headless resume (WAL checkpoint → `--resume` → sessionId verification → sidebar visibility write-back) or the native channel (queues natively while the session is busy). `append` queues; `interrupt` refuses while busy. `modelRef` / `matchSessionModel` run it on a specific model (pure JS, no Python needed). |
-| `plan_quota` | *Optional.* Zhipu/Z.ai coding-plan usage (5-hour & weekly windows). Requires `session.json` keys; returns guidance when unconfigured. |
+
+### 额度面（Quota / plan）
+
+| Tool | What it does |
+| --- | --- |
+| `plan_quota` | *Optional.* Zhipu/Z.ai coding-plan usage (5-hour & weekly windows) via `open.bigmodel.cn`, authenticated with an `apiKey` from `session.json` `keys`. Returns guidance when unconfigured. |
+| `plan_start` | View the ZCode **start plan** account face (`zcode.z.ai`): active subscriptions, per-model balance buckets (total/used/remaining/expiry), and currently claimable plans. Credentials are decrypted from the desktop login store `~/.zcode/v2/credentials.json` (same `enc:v1` AES-256-GCM scheme as the client — nothing is sent anywhere except `zcode.z.ai`). |
+| `plan_reset_card` | Coding-plan **reset cards**: `status` (inventory of 5-hour/weekly cards + usage history), `use` (consume one card to instantly reset that window — **confirm-gated**, `resetType=FIVE_HOUR\|WEEK`, idempotency key auto-generated), `opportunity` (trigger one card-grant chance; the desktop client already polls this itself — don't loop it), `history_read`. |
+| `plan_claim` | Manual-claim plan face: `preview` lists currently claimable plans (safe to poll on a schedule); `claim` requires the Aliyun **captcha** verify param — the server enforces human verification, so fully-automatic claiming is impossible by design; the ZCode client's claim dialog is the easy path. |
+| `plan_switch` | View/switch which `session.json` key alias is `current` (the one `plan_quota` queries by default). Local config only — does not touch ZCode client providers. |
 
 ## Semantics worth knowing
 
@@ -105,6 +114,9 @@ Then register with your MCP client.
 | `ZCODE_SESSION_CLI` | `E:\zcode\resources\glm\zcode.cjs` | zcode CLI entry (headless channel). |
 | `ZCODE_SESSION_NODE` | `process.execPath` | Node executable for headless children (>= 22.5). |
 | `ZCODE_SESSION_QUOTA_BASE` | Zhipu endpoint | Quota API base. |
+| `ZCODE_SESSION_PLAN_BASE` | `https://zcode.z.ai` | start plan / reset card API base. |
+| `ZCODE_SESSION_APP_VERSION` | `3.14.4` | `app_version` sent to zcode.z.ai (server validates it — keep in sync with the client). |
+| `ZCODE_CREDENTIAL_SECRET` | fallback string | Only if the desktop was launched with a custom credential secret. |
 
 ## History
 
