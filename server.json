@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Aelindra/zcode-session-mcp",
-  "description": "Session management MCP server for ZCode (zai-org/ZCode): list/search/read/create/rename/pin/archive/delete local sessions, check liveness, run new sessions or send prompts into existing ones. Zero-dependency single file, Windows-first, semantics aligned with the ZCode client source.",
+  "description": "Session CRUD, search, liveness, run & prompt injection for ZCode local sessions. Zero-dependency.",
   "title": "ZCode Session MCP",
   "websiteUrl": "https://github.com/Aelindra/zcode-session-mcp",
   "repository": {
