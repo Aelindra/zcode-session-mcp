@@ -1,0 +1,7 @@
+# 本地凭据与运行产物，绝不入库/发包
+session.json
+fleet.json
+logs/
+*.tmp.mjs
+node_modules/
+.zcode-tmp/

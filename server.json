@@ -1,0 +1,59 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Aelindra/zcode-session-mcp",
+  "description": "Session management MCP server for ZCode (zai-org/ZCode): list/search/read/create/rename/pin/archive/delete local sessions, check liveness, run new sessions or send prompts into existing ones. Zero-dependency single file, Windows-first, semantics aligned with the ZCode client source.",
+  "title": "ZCode Session MCP",
+  "websiteUrl": "https://github.com/Aelindra/zcode-session-mcp",
+  "repository": {
+    "url": "https://github.com/Aelindra/zcode-session-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "authors": [
+    {
+      "name": "Aelindra"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "zcode",
+    "zai",
+    "glm",
+    "session",
+    "session-management",
+    "agent",
+    "coding-agent",
+    "sqlite"
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "zcode-session-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ZCODE_SESSION_HOME",
+          "description": "ZCode data home (defaults to ~/.zcode)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ZCODE_SESSION_CLI",
+          "description": "Path to zcode.cjs for the headless channel (native scheduler channel needs no CLI)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ZCODE_SESSION_NODE",
+          "description": "Node >= 22.5 executable for headless children (defaults to the server's own runtime)",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
