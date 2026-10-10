@@ -17,7 +17,7 @@
 //   rename=custom 粘性       apps/zcode-cli/packages/core/src/runtime/methods/session-title.ts:264
 //   删除=软删 tombstone      packages/services/src/zcode-agent/zcodeTaskServiceAdapter.ts:2855（tasks.deleted=1）
 //   模型选择真源             db.sqlite session_entry(runtime/model_selection)，resume 侧按条目选模型
-// 可选配置 session.json（兼容旧 zcode-fleet-mcp/fleet.json）：智谱额度 keyAlias 与 providerMap。
+// 可选配置 session.json：智谱额度 keyAlias 与 providerMap。
 
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
@@ -43,7 +43,6 @@ const ROLLOUT_DIR = join(ZCODE_HOME, "cli", "rollout");
 const ARTIFACTS_DIR = join(ZCODE_HOME, "cli", "artifacts");
 const V2_CONFIG = join(ZCODE_HOME, "v2", "config.json");
 const CONFIG_PATH = process.env.ZCODE_SESSION_CONFIG || join(SCRIPT_DIR, "session.json");
-const CONFIG_LEGACY = join(SCRIPT_DIR, "fleet.json"); // 旧 zcode-fleet-mcp 同目录 fleet.json 兼容读取
 const QUOTA_BASE = process.env.ZCODE_SESSION_QUOTA_BASE || "https://open.bigmodel.cn/api/monitor/usage";
 const ZCODE_CJS = process.env.ZCODE_SESSION_CLI || "E:\\zcode\\resources\\glm\\zcode.cjs";
 const NODE_EXE = process.env.ZCODE_SESSION_NODE || process.execPath;
@@ -115,17 +114,15 @@ function newSessionId() { return `sess_${randomUUID()}`; }
 
 const SESSION_ID_RE = /^sess_[A-Za-z0-9._-]+$/;
 
-// ---------------------------------------------------------------- session.json 配置（可选；兼容旧 fleet.json）
+// ---------------------------------------------------------------- session.json 配置（可选）
 
 function loadConfig() {
-  for (const p of [CONFIG_PATH, CONFIG_LEGACY]) {
-    if (existsSync(p)) {
-      try {
-        return { config: JSON.parse(readFileSync(p, "utf8")), path: p, legacy: p === CONFIG_LEGACY };
-      } catch (e) { log("配置解析失败:", p, errText(e)); }
-    }
+  if (existsSync(CONFIG_PATH)) {
+    try {
+      return { config: JSON.parse(readFileSync(CONFIG_PATH, "utf8")), path: CONFIG_PATH };
+    } catch (e) { log("配置解析失败:", CONFIG_PATH, errText(e)); }
   }
-  return { config: null, path: CONFIG_PATH, legacy: false };
+  return { config: null, path: CONFIG_PATH };
 }
 
 function configTemplate() {
@@ -145,7 +142,7 @@ function ensureConfig() {
     writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf8");
     log("已生成模板配置", CONFIG_PATH);
   } catch (e) { log("写模板配置失败:", errText(e)); }
-  return { config: cfg, path: CONFIG_PATH, legacy: false, created: true };
+  return { config: cfg, path: CONFIG_PATH, created: true };
 }
 
 // ---------------------------------------------------------------- 模型选择（纯 JS，对齐桌面端真源 session_entry）
@@ -1675,13 +1672,6 @@ function dispatch(name, args) {
     case "session_send": return sessionSend(args || {});
     case "session_model": return Promise.resolve(sessionModelSet(args || {}));
     case "plan_quota": return planQuota(args || {});
-    // 旧 zcode-fleet-mcp 工具名兼容映射（不在 tools/list 里广告）
-    case "fleet_list_sessions": return Promise.resolve(listSessions(args || {}));
-    case "fleet_agent_status": return Promise.resolve(sessionStatus(args || {}));
-    case "fleet_inject_prompt": return sessionSend(args || {});
-    case "fleet_spawn_session": return sessionRun(args || {});
-    case "fleet_set_session_model": return Promise.resolve(sessionModelSet(args || {}));
-    case "fleet_quota": return planQuota(args || {});
     default: return Promise.resolve(errResult("UNKNOWN_TOOL", `未知工具: ${name}（本 server 是 zcode-session-mcp，工具列表见 tools/list）`));
   }
 }

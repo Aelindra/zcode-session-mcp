@@ -101,14 +101,14 @@ Then register with your MCP client.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ZCODE_SESSION_HOME` | `~/.zcode` | ZCode data home. |
-| `ZCODE_SESSION_CONFIG` | `<server dir>/session.json` | Optional config (quota keys, providerMap). Falls back to legacy `fleet.json` from `zcode-fleet-mcp`. |
+| `ZCODE_SESSION_CONFIG` | `<server dir>/session.json` | Optional config (quota keys, providerMap). |
 | `ZCODE_SESSION_CLI` | `E:\zcode\resources\glm\zcode.cjs` | zcode CLI entry (headless channel). |
 | `ZCODE_SESSION_NODE` | `process.execPath` | Node executable for headless children (>= 22.5). |
 | `ZCODE_SESSION_QUOTA_BASE` | Zhipu endpoint | Quota API base. |
 
 ## History
 
-This is the renamed, expanded successor of `zcode-fleet-mcp` (a cross-session "fleet" tool). Session CRUD was rebuilt on top of a source-level study of the ZCode client's own session store; old `fleet_*` tool names keep working as aliases but are not advertised.
+This is the renamed, expanded successor of `zcode-fleet-mcp` (a cross-session "fleet" tool). Session CRUD was rebuilt on top of a source-level study of the ZCode client's own session store; the old `fleet_*` tool names and legacy config fallback were removed — use the `session_*` tools and `session.json`.
 
 ## Disclaimer
 
