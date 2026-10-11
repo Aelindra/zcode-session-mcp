@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // zcode-session-mcp —— ZCode (zai-org/ZCode) 本机会话管理 MCP server (stdio, JSON-RPC 2.0)
 //
-// 纯 Node.js 单文件、零依赖；要求 node >= 22.5（node:sqlite；headless 子进程需 >= 22.13 更稳）。
+// 纯 Node.js 单文件、零依赖；要求 node >= 22.5（node:sqlite）。运行/注入只走客户端原生通道（桌面调度器 automations 表）。
 // 能力对照 zcode 客户端源码（apps/zcode-cli）的会话管理面：
 //   查: session_list / session_get / session_messages / session_search / session_status
 //   增: session_create（落 session 行，复刻 ensureSessionPersisted 语义）/ session_run（跑一个新会话）
@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID, createHash, createDecipheriv } from "node:crypto";
 import process from "node:process";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const DB_TASKS_TIMEOUT_MS = 5000;
 // scheduler 每 20s 轮询 automations（packages/desktop/src/scheduler）；misfire 宽限 5 分钟，
 // 插行的 next_run_at 必须 ≈ now，否则被判"错过窗口"直接跳过。
@@ -52,7 +52,6 @@ const ZCODE_PLAN_BASE = process.env.ZCODE_SESSION_PLAN_BASE || "https://zcode.z.
 const ZCODE_APP_VERSION = process.env.ZCODE_SESSION_APP_VERSION || "3.14.4"; // 服务端校验该参数，须用客户端在发版本
 const CREDENTIALS_FILE = join(ZCODE_HOME, "v2", "credentials.json");
 const TELEMETRY_STATE = join(ZCODE_HOME, "v2", "telemetry-state.json");
-const ZCODE_CJS = process.env.ZCODE_SESSION_CLI || "E:\\zcode\\resources\\glm\\zcode.cjs";
 const NODE_EXE = process.env.ZCODE_SESSION_NODE || process.execPath;
 const DEFAULT_CWD = join(ZCODE_HOME, "workspace");
 const ACTIVE_WINDOW_MS = 10 * 60 * 1000; // 近10分钟有消息 = 此刻在飞（最可靠判活信号；task_status 可能是崩溃残留）
@@ -191,7 +190,7 @@ function resolveModelRef(ref) {
       const exact = reg[pid].find((m) => m.toLowerCase() === mid.trim().toLowerCase());
       if (exact) return { providerId: pid, modelId: exact };
     }
-    return { providerId: pid, modelId: mid.trim() }; // 注册表缺失时放行（headless 可能动态注册）
+    return { providerId: pid, modelId: mid.trim() }; // 注册表缺失时放行（新模型可能尚未入注册表）
   }
   for (const pid of Object.keys(reg).sort()) {
     const exact = reg[pid].find((m) => m.toLowerCase() === s.toLowerCase());
@@ -227,7 +226,7 @@ function taskRow(dbt, sessionId) {
 }
 
 function ensureTaskRow(dbt, sessionId, { title, directory }) {
-  // 无行先收编（headless/手工建的会话默认不在侧栏）——字段形状照抄桌面端现有行，前端渲染依赖 meta_json
+  // 无行先收编（CLI/手工建的会话默认不在侧栏）——字段形状照抄桌面端现有行，前端渲染依赖 meta_json
   const nowMs = Date.now();
   const existing = taskRow(dbt, sessionId);
   if (existing) return existing;
@@ -666,7 +665,7 @@ function sessionCreate(args) {
       ok: true, session_id: sessionId, title, project_id: projectId, directory,
       mode, model: modelInfo, taskIndex,
       limitations: [
-        "这是空会话记录（无消息）：可用于组织/归档/改名/预选模型；要让它干活请用 session_send 注入首条提示词（headless resume 会补 runtime entry）。",
+        "这是空会话记录（无消息）：可用于组织/归档/改名/预选模型；要让它干活请用 session_send 注入首条提示词。",
         "客户端侧栏若未立即出现，重启前端或打开该 workspace 即可（tasks-index 已收编）。",
       ],
       next: `session_send { sessionId: "${sessionId}", prompt: "..." }`,
@@ -1069,36 +1068,7 @@ async function nativeDispatch(args) {
   });
 }
 
-// ---------------------------------------------------------------- 进程执行 / 后台作业
-
-function runProcess(cmd, args, timeoutMs) {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd: HOME, windowsHide: true, env: process.env });
-    let stdout = "", stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) { try { child.kill(); } catch { /* noop */ } settled = true; resolve({ timedOut: true, code: null, stdout, stderr }); }
-    }, timeoutMs);
-    child.stdout.on("data", (d) => { stdout += d; if (stdout.length > 200000) stdout = stdout.slice(-100000); });
-    child.stderr.on("data", (d) => { stderr += d; if (stderr.length > 100000) stderr = stderr.slice(-50000); });
-    child.on("error", (e) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ spawnError: errText(e), code: null, stdout, stderr }); } });
-    child.on("close", (code) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ timedOut: false, code, stdout, stderr }); } });
-  });
-}
-
-function parseLastJson(text) {
-  // zcode.cjs --json 的最终 result 是 pretty-print 多行 JSON：从后往前找"{"行，拼接到末尾再 parse
-  const lines = text.trim().split(/\r?\n/);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (line === "{") {
-      try { return JSON.parse(lines.slice(i).join("\n")); } catch { /* 继续向前找 */ }
-    } else if (line.startsWith("{")) {
-      try { return JSON.parse(line); } catch { /* 单行 JSON 继续 */ }
-    }
-  }
-  return null;
-}
+// ---------------------------------------------------------------- 后台作业（受理即返回的异步执行）
 
 const LOG_DIR = join(SCRIPT_DIR, "logs");
 
@@ -1131,104 +1101,12 @@ async function bgRun(jobPath) {
   process.exit(0);
 }
 
-// ---------------------------------------------------------------- 客户端可见性回写
-
-function touchTaskIndex(sessionId) {
-  // headless 只写 db.sqlite 不写 tasks-index，且前端会从 message 表 error 重建任务状态，两处都要同步
-  const nowMs = Date.now();
-  const out = { messageErrorCleared: 0, taskIndexUpdated: false, taskIndexEnsured: false };
-  let sessInfo = null;
-  try {
-    const db = openDbRw(DB_MAIN);
-    try {
-      sessInfo = db.prepare("SELECT directory, title FROM session WHERE id = ?").get(sessionId) || null;
-      const rows = db.prepare(
-        "SELECT id, data FROM message WHERE session_id = ? AND json_extract(data,'$.error') IS NOT NULL"
-      ).all(sessionId);
-      const upd = db.prepare("UPDATE message SET data = ? WHERE id = ?");
-      for (const r of rows) {
-        let d;
-        try { d = JSON.parse(r.data); } catch { continue; }
-        delete d.error;
-        upd.run(JSON.stringify(d), r.id);
-        out.messageErrorCleared++;
-      }
-    } finally { db.close(); }
-  } catch (e) { out.messageErrorClearError = errText(e); }
-  try {
-    const dbt = openDbRw(DB_TASKS);
-    try {
-      ensureTaskRow(dbt, sessionId, { title: sessInfo && sessInfo.title, directory: sessInfo && sessInfo.directory });
-      out.taskIndexEnsured = true;
-      const row = dbt.prepare("SELECT meta_json FROM tasks WHERE task_id = ? AND deleted = 0").get(sessionId);
-      if (row && row.meta_json) {
-        try {
-          const meta = JSON.parse(row.meta_json);
-          meta.status = "idle";
-          meta.updatedAt = nowMs;
-          delete meta.lastError;
-          dbt.prepare("UPDATE tasks SET updated_at=?, unread_at=?, task_status='idle', meta_json=? WHERE task_id=? AND deleted=0")
-            .run(nowMs, nowMs, JSON.stringify(meta), sessionId);
-        } catch { /* meta 坏行 */ }
-      } else {
-        dbt.prepare("UPDATE tasks SET updated_at=?, unread_at=?, task_status='idle' WHERE task_id=? AND deleted=0")
-          .run(nowMs, nowMs, sessionId);
-      }
-      out.taskIndexUpdated = true;
-    } finally { dbt.close(); }
-  } catch (e) { out.taskIndexError = errText(e); }
-  return out;
-}
-
 // ---------------------------------------------------------------- session_send（注入提示词）
 
 async function sessionSend(args) {
   const sessionId = args.sessionId, prompt = args.prompt, mode = args.mode || "append";
   if (!sessionId || !prompt) return errResult("BAD_ARGS", "缺少必填参数 sessionId / prompt");
   if (!["append", "interrupt"].includes(mode)) return errResult("BAD_ARGS", "mode 只支持 append | interrupt");
-
-  // 原生通道（native=true）：target_task_id=sessionId 的一次性自动化行 → 桌面调度器 → host resumeTask+sendPrompt
-  if (Boolean(args.native)) {
-    if (!existsSync(DB_TASKS)) return errResult("DB_NOT_FOUND", `未找到 ${DB_TASKS}`);
-    let directory = null;
-    try {
-      const db = openDbRo(DB_MAIN);
-      try {
-        const s = db.prepare("SELECT id, directory FROM session WHERE id = ?").get(sessionId);
-        if (!s) return errResult("SESSION_NOT_FOUND", `db.sqlite 中不存在会话 ${sessionId}`);
-        if (!s.directory) return errResult("NO_CWD", `会话 ${sessionId} 缺少 directory，无法确定派发 workspace`);
-        directory = s.directory;
-      } finally { db.close(); }
-    } catch (e) { return errResult("DB_OPEN_FAILED", errText(e)); }
-    if (!existsSync(directory)) return errResult("CWD_NOT_FOUND", `会话工作目录不存在: ${directory}`);
-    if (!Boolean(args.wait)) {
-      const jb = launchBackground("send", args);
-      return okResult({
-        ok: true, accepted: true, async: true, native: true, mode, sessionId,
-        jobId: jb.jobId, resultPath: jb.resultPath,
-        note: "原生注入已受理（后台插 automations 行并等调度器认领派发）。复核：Read resultPath；侧栏该会话会实时显示运行状态。",
-      });
-    }
-    const result = await nativeDispatch({ prompt, targetTaskId: sessionId, cwd: directory, claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
-    if (result.content) {
-      try {
-        const body = JSON.parse(result.content[0].text);
-        if (body.ok) body.directory = directory;
-      } catch { /* noop */ }
-    }
-    return result;
-  }
-
-  if (!existsSync(ZCODE_CJS)) return errResult("ZCODE_CJS_NOT_FOUND", `未找到 zcode CLI (${ZCODE_CJS})。可用环境变量 ZCODE_SESSION_CLI 指定 zcode.cjs 路径，或改用 native=true 走桌面调度器（需 ZCode 桌面端在运行）。`);
-  if (!existsSync(NODE_EXE)) return errResult("NODE_EXE_NOT_FOUND", `未找到 node >= 22.5 (${NODE_EXE})。可用 ZCODE_SESSION_NODE 指定。`);
-
-  const need = requireSession(sessionId);
-  if (need.error) return need.error;
-  const session = need.row;
-  if (!session.directory) return errResult("NO_CWD", `会话 ${sessionId} 缺少 directory，无法确定 --cwd`);
-  if (!existsSync(session.directory)) return errResult("CWD_NOT_FOUND", `会话工作目录不存在: ${session.directory}`);
-
-  const startedAt = Date.now();
 
   // mode=interrupt 语义：会话在飞 → 拒绝注入（避免插队/冲突）；空闲 → 等价 append
   if (mode === "interrupt") {
@@ -1241,89 +1119,35 @@ async function sessionSend(args) {
     }
   }
 
+  // 原生通道（唯一通道）：target_task_id=sessionId 的一次性自动化行 → 桌面调度器 → host resumeTask+sendPrompt（在飞时原生排队）
+  if (!existsSync(DB_TASKS)) return errResult("DB_NOT_FOUND", `未找到 ${DB_TASKS}`);
+  let directory = null;
+  try {
+    const db = openDbRo(DB_MAIN);
+    try {
+      const s = db.prepare("SELECT id, directory FROM session WHERE id = ?").get(sessionId);
+      if (!s) return errResult("SESSION_NOT_FOUND", `db.sqlite 中不存在会话 ${sessionId}`);
+      if (!s.directory) return errResult("NO_CWD", `会话 ${sessionId} 缺少 directory，无法确定派发 workspace`);
+      directory = s.directory;
+    } finally { db.close(); }
+  } catch (e) { return errResult("DB_OPEN_FAILED", errText(e)); }
+  if (!existsSync(directory)) return errResult("CWD_NOT_FOUND", `会话工作目录不存在: ${directory}`);
   if (!Boolean(args.wait)) {
     const jb = launchBackground("send", args);
     return okResult({
       ok: true, accepted: true, async: true, mode, sessionId,
       jobId: jb.jobId, resultPath: jb.resultPath,
-      note: "注入已受理并在后台执行，一次性返回不阻塞。复核：① Read resultPath（含 verified/stdoutTail）；② session_status 看消息数增长。结果文件生成前（可能数分钟）绝不重发注入，否则双跑。若目标会话在飞，后台会以 REFUSED_ACTIVE_PROMPT_EXISTS 拒绝，见结果文件。",
+      note: "原生注入已受理（后台插 automations 行并等调度器认领派发）。复核：Read resultPath；侧栏该会话会实时显示运行状态。",
     });
   }
-
-  // 可选：按指定模型注入（纯 JS：写 session_entry runtime/model_selection，resume 侧按条目选模型）
-  const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || 300000, 30000), 3600000);
-  let modelInfo = null;
-  if (args.modelRef || args.matchSessionModel) {
-    let modelFull = args.modelRef || null;
-    if (!modelFull) {
-      let sel = null;
-      try {
-        const db = openDbRo(DB_MAIN);
-        try { sel = getSessionModelEntry(db, sessionId); } finally { db.close(); }
-      } catch { /* ignore */ }
-      const pid = sel && sel.providerId, mid = sel && sel.modelId;
-      if (!pid || !mid) return errResult("SESSION_MODEL_UNKNOWN", "会话未保存模型选择，matchSessionModel 无法执行");
-      modelFull = `${pid}/${mid}`;
-    }
-    const r = resolveModelRef(String(modelFull));
-    if (!r) return errResult("MODEL_REF_UNRESOLVED", `无法解析模型引用 "${modelFull}"`);
+  const result = await nativeDispatch({ prompt, targetTaskId: sessionId, cwd: directory, claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
+  if (result.content) {
     try {
-      const db = openDbRw(DB_MAIN);
-      try {
-        setSessionModelEntry(db, sessionId, r.providerId, r.modelId, "max");
-      } finally { db.close(); }
-    } catch (e) { return errResult("SESSION_MODEL_SET_FAILED", `会话模型条目写入失败（目标 ${r.providerId}/${r.modelId}）: ${errText(e)}`); }
-    modelInfo = { requested: modelFull, providerId: r.providerId, modelId: r.modelId, thoughtLevel: "max" };
+      const body = JSON.parse(result.content[0].text);
+      if (body.ok) body.directory = directory;
+    } catch { /* noop */ }
   }
-
-  // WAL checkpoint（缩小 headless 与桌面端的 WAL 并发冲突面；best-effort：桌面持锁时跳过）
-  let walCheckpoint = "skipped";
-  try {
-    const dbw = openDbRw(DB_MAIN);
-    try { dbw.exec("PRAGMA wal_checkpoint(TRUNCATE)"); walCheckpoint = "ok"; } finally { dbw.close(); }
-  } catch (e) { walCheckpoint = "failed: " + errText(e); }
-
-  const res = await runProcess(NODE_EXE, [ZCODE_CJS, "-p", prompt, "--resume", sessionId, "--cwd", session.directory, "--mode", "yolo", "--json"], timeoutMs);
-  const tail = (s) => (s || "").slice(-2000);
-
-  if (res.timedOut) {
-    return errResult("SEND_TIMEOUT", `注入超时(${timeoutMs}ms)被终止。会话可能已收到指令，请用 session_status 复核。`, { stdoutTail: tail(res.stdout), model: modelInfo });
-  }
-  if (res.spawnError) return errResult("SPAWN_FAILED", res.spawnError);
-
-  if (/active prompt exists/i.test(res.stdout + res.stderr)) {
-    return errResult("REFUSED_ACTIVE_PROMPT_EXISTS",
-      "桌面端正在使用该会话（active prompt exists），放弃注入以免打断用户。",
-      { stdoutTail: tail(res.stdout) });
-  }
-  if (/unable to open database/i.test(res.stderr)) {
-    return errResult("DB_BUSY", "headless 启动撞上 WAL 锁（unable to open database）。等10秒后重试一次。", { stderrTail: tail(res.stderr) });
-  }
-  if (res.code !== 0) {
-    return errResult("ZCODE_EXIT_NONZERO", `zcode CLI 退出码 ${res.code}`, { stdoutTail: tail(res.stdout), stderrTail: tail(res.stderr) });
-  }
-
-  // 校验 resume 生效：末行 JSON sessionId 必须 == 目标
-  const lastJson = parseLastJson(res.stdout);
-  const resumedSid = lastJson && lastJson.sessionId;
-  const verified = resumedSid === sessionId;
-  const visibilitySync = verified ? touchTaskIndex(sessionId) : null;
-  return okResult({
-    ok: verified,
-    mode,
-    sessionId,
-    resumedSessionId: resumedSid || null,
-    verified,
-    walCheckpoint,
-    model: modelInfo,
-    visibilitySync,
-    durationMs: Date.now() - startedAt,
-    stdoutTail: tail(res.stdout),
-    stderrTail: tail(res.stderr),
-    note: verified
-      ? "resume 校验通过，客户端可见性已回写（未读/状态复位 + 清历史 error 标记）。"
-      : (resumedSid ? `判定失败：实际新建了会话 ${resumedSid} 而非续跑，不要当成功。` : "未能从 stdout 解析 sessionId JSON。"),
-  });
+  return result;
 }
 
 // ---------------------------------------------------------------- session_run（新起会话）
@@ -1332,56 +1156,16 @@ async function sessionRun(args) {
   const prompt = args.prompt;
   if (!prompt) return errResult("BAD_ARGS", "缺少必填参数 prompt");
 
-  const native = args.native === undefined ? true : Boolean(args.native);
-  if (native) {
-    if (!Boolean(args.wait)) {
-      const jb = launchBackground("run", args);
-      return okResult({
-        ok: true, accepted: true, async: true, native: true,
-        jobId: jb.jobId, resultPath: jb.resultPath,
-        note: "原生 spawn 已受理（后台插 automations 行并等调度器认领）。复核：Read resultPath 拿 sessionId（一般 ≤20s 认领 + 数秒建会话）；桌面侧栏会实时出现该会话并显示运行状态。结果文件生成前绝不重发。",
-      });
-    }
-    return nativeDispatch({ prompt, cwd: args.cwd, mode: "yolo", claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
-  }
-
-  if (!existsSync(ZCODE_CJS)) return errResult("ZCODE_CJS_NOT_FOUND", `未找到 zcode CLI (${ZCODE_CJS})。可用环境变量 ZCODE_SESSION_CLI 指定，或改用 native=true（需 ZCode 桌面端在运行）。`);
-  if (!existsSync(NODE_EXE)) return errResult("NODE_EXE_NOT_FOUND", `未找到 node >= 22.5 (${NODE_EXE})。可用 ZCODE_SESSION_NODE 指定。`);
-
-  const cwd = args.cwd || DEFAULT_CWD;
-  if (!existsSync(cwd)) return errResult("CWD_NOT_FOUND", `工作目录不存在: ${cwd}`);
-
+  // 原生通道（唯一通道）：写 tasks-index 一次性 automation 行 → 桌面调度器 → host 原生 createTask+sendPrompt
   if (!Boolean(args.wait)) {
     const jb = launchBackground("run", args);
     return okResult({
-      ok: true, accepted: true, async: true, cwd,
+      ok: true, accepted: true, async: true, native: true,
       jobId: jb.jobId, resultPath: jb.resultPath,
-      note: "新会话已在后台创建执行，一次性返回不阻塞。拿 sessionId：① Read resultPath（content[0].text 的 sessionId 字段）；② 稍后 session_list 按 title/directory 查。结果文件生成前绝不重发，否则重复建会话。",
+      note: "原生 spawn 已受理（后台插 automations 行并等调度器认领）。复核：Read resultPath 拿 sessionId（一般 ≤20s 认领 + 数秒建会话）；桌面侧栏会实时出现该会话并显示运行状态。结果文件生成前绝不重发。",
     });
   }
-
-  const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || 600000, 30000), 1800000);
-  const startedAt = Date.now();
-  const res = await runProcess(NODE_EXE, [ZCODE_CJS, "-p", prompt, "--cwd", cwd, "--mode", "yolo", "--json", "--surface", "terminal"], timeoutMs);
-  const tail = (s) => (s || "").slice(-2000);
-
-  if (res.timedOut) return errResult("RUN_TIMEOUT", `新会话运行超时(${timeoutMs}ms)被终止（会话可能已持久化，可用 session_list 查找）。`, { stdoutTail: tail(res.stdout) });
-  if (res.spawnError) return errResult("SPAWN_FAILED", res.spawnError);
-  if (res.code !== 0) return errResult("ZCODE_EXIT_NONZERO", `zcode CLI 退出码 ${res.code}`, { stdoutTail: tail(res.stdout), stderrTail: tail(res.stderr) });
-
-  const lastJson = parseLastJson(res.stdout);
-  const sid = (lastJson && lastJson.sessionId) || null;
-  const visibilitySync = sid ? touchTaskIndex(sid) : null;
-  return okResult({
-    ok: true,
-    sessionId: sid,
-    cwd,
-    durationMs: Date.now() - startedAt,
-    result: lastJson || null,
-    stdoutTail: tail(res.stdout),
-    visibilitySync,
-    note: "新会话已回写客户端任务列表（前端侧栏可见）；若仍未显示，重启前端或把该会话在桌面端打开一次。",
-  });
+  return nativeDispatch({ prompt, cwd: args.cwd, mode: "yolo", claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
 }
 
 // ---------------------------------------------------------------- session_model（改模型选择，纯 JS）
@@ -1417,7 +1201,7 @@ function sessionModelSet(args) {
 
   return okResult({
     ok: true, sessionId, providerId: r.providerId, modelId: r.modelId, thoughtLevel, taskIndex,
-    note: "已写 runtime/model_selection（真源）+ tasks-index.model（侧栏展示）：桌面端 UI 与后续人工续跑生效；headless resume 不读它——按模型注入请用 session_send 的 modelRef。",
+    note: "已写 runtime/model_selection（真源）+ tasks-index.model（侧栏展示）：桌面端 UI、人工续跑与原生注入均按此模型跑。",
   });
 }
 
@@ -1963,44 +1747,38 @@ const TOOLS = [
   },
   {
     name: "session_run",
-    description: "新起会话跑一个提示词。默认 native=true：写 tasks-index 一次性 automation 行，由 ZCode 桌面调度器（20s 轮询）认领后原生 createTask+sendPrompt——侧栏实时出现、状态正确。native=false 走 zcode CLI headless（需 ZCODE_SESSION_CLI 指向 zcode.cjs）。默认一次性受理后台执行立即返回 resultPath。Start a new session with a prompt.",
+    description: "新起会话跑一个提示词：写 tasks-index 一次性 automation 行，由 ZCode 桌面调度器（20s 轮询）认领后原生 createTask+sendPrompt——侧栏实时出现、状态正确。默认一次性受理后台执行立即返回 resultPath。Start a new session with a prompt.",
     inputSchema: {
       type: "object",
       properties: {
         prompt: { type: "string", description: "提示词" },
-        cwd: { type: "string", description: "工作目录，默认 ~/.zcode/workspace；原生通道要求是桌面端已打开的 workspace" },
-        native: { type: "boolean", description: "默认 true=原生通道；false=headless" },
+        cwd: { type: "string", description: "工作目录，默认 ~/.zcode/workspace；要求是桌面端已打开的 workspace" },
         wait: { type: "boolean", description: "默认 false=受理即返回；true=阻塞等跑完" },
-        timeoutMs: { type: "number", description: "headless 运行超时，默认600000" },
-        claimTimeoutMs: { type: "number", description: "native 等认领超时，默认90000" },
-        sessionTimeoutMs: { type: "number", description: "native 等会话创建超时，默认120000" },
+        claimTimeoutMs: { type: "number", description: "等认领超时，默认90000" },
+        sessionTimeoutMs: { type: "number", description: "等会话创建超时，默认120000" },
       },
       required: ["prompt"],
     },
   },
   {
     name: "session_send",
-    description: "向既有会话注入提示词：headless resume（WAL checkpoint → resume → sessionId 校验 → 客户端可见性回写）或 native=true 原生通道（桌面端 resumeTask+sendPrompt，在飞时原生排队）。mode=append 排队补指令；interrupt 在飞时拒绝。modelRef/matchSessionModel 按指定模型跑（写 session_entry 真源，纯 JS 无需 python）。Send a prompt into an existing session.",
+    description: "向既有会话注入提示词（原生通道）：写 automations 行 → 桌面端 resumeTask+sendPrompt，侧栏实时可见、在飞时原生排队。mode=append 排队补指令；interrupt 在飞时拒绝。按指定模型注入：先 session_model 写会话模型再注入。Send a prompt into an existing session.",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string", description: "目标会话 id (sess_*)" },
         prompt: { type: "string", description: "要注入的提示词" },
         mode: { type: "string", enum: ["append", "interrupt"], description: "默认 append" },
-        native: { type: "boolean", description: "true=原生通道（侧栏实时可见、在飞时原生排队）" },
-        modelRef: { type: "string", description: "可选；按此模型注入（providerId/modelId 或模型 id 片段），仅 headless 通道生效" },
-        matchSessionModel: { type: "boolean", description: "可选；按会话已存模型注入（无则报错）" },
         wait: { type: "boolean", description: "默认 false=受理即返回 resultPath；true=阻塞等跑完" },
-        timeoutMs: { type: "number", description: "headless 运行超时，默认300000，上限3600000" },
-        claimTimeoutMs: { type: "number", description: "native 等认领超时" },
-        sessionTimeoutMs: { type: "number", description: "native 等派发确认超时" },
+        claimTimeoutMs: { type: "number", description: "等认领超时" },
+        sessionTimeoutMs: { type: "number", description: "等派发确认超时" },
       },
       required: ["sessionId", "prompt"],
     },
   },
   {
     name: "session_model",
-    description: "设置会话保存的模型选择：写 db.sqlite session_entry(runtime/model_selection) 真源 + tasks-index.model 侧栏展示。桌面端 UI 与后续人工续跑生效；headless resume 不读它（按模型注入用 session_send 的 modelRef）。Set the session's saved model selection.",
+    description: "设置会话保存的模型选择：写 db.sqlite session_entry(runtime/model_selection) 真源 + tasks-index.model 侧栏展示。桌面端 UI、人工续跑与原生注入（session_send）均按此模型跑。Set the session's saved model selection.",
     inputSchema: {
       type: "object",
       properties: {

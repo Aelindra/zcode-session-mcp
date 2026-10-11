@@ -16,8 +16,8 @@ ZCode keeps session facts in `~/.zcode/cli/db/db.sqlite` (sessions, messages, pa
 ┌─────────────────┐   stdio/JSON-RPC    ┌──────────────────────┐   reads/writes   ┌────────────────────────────┐
 │ any MCP client  │ ◄─────────────────► │ zcode-session-mcp    │ ───────────────► │ ~/.zcode/cli/db/db.sqlite  │  (facts)
 └─────────────────┘                     └──────────────────────┘                  ├────────────────────────────┤
-                                        └─ optional: zcode CLI headless ──►    │ ~/.zcode/v2/tasks-index…   │  (sidebar org)
-                                        └─ optional: desktop scheduler  ──►    └────────────────────────────┘
+                                        └─ run/send: desktop scheduler ──►     │ ~/.zcode/v2/tasks-index…   │  (sidebar org + automations)
+                                                                                └────────────────────────────┘
 ```
 
 ## Install
@@ -84,8 +84,8 @@ Then register with your MCP client.
 
 | Tool | What it does |
 | --- | --- |
-| `session_run` | Start a **new** session with a prompt. Default `native: true` inserts a one-shot row into the desktop scheduler's automations table; the ZCode app (20s polling) picks it up and runs it natively — the session appears live in the sidebar. `native: false` runs the zcode CLI headless. Returns immediately with a `resultPath` you can read later. |
-| `session_send` | Inject a prompt into an **existing** session: headless resume (WAL checkpoint → `--resume` → sessionId verification → sidebar visibility write-back) or the native channel (queues natively while the session is busy). `append` queues; `interrupt` refuses while busy. `modelRef` / `matchSessionModel` run it on a specific model (pure JS, no Python needed). |
+| `session_run` | Start a **new** session with a prompt. Inserts a one-shot row into the desktop scheduler's automations table; the ZCode app (20s polling) picks it up and runs it natively — the session appears live in the sidebar. Returns immediately with a `resultPath` you can read later. |
+| `session_send` | Inject a prompt into an **existing** session via the native channel (desktop `resumeTask`+`sendPrompt`; queues natively while the session is busy). `append` queues; `interrupt` refuses while busy. To run on a specific model, set it first with `session_model` (the native resume honors the session's saved model selection). |
 
 ### 额度面（Quota / plan）
 
@@ -111,8 +111,7 @@ Then register with your MCP client.
 | --- | --- | --- |
 | `ZCODE_SESSION_HOME` | `~/.zcode` | ZCode data home. |
 | `ZCODE_SESSION_CONFIG` | `<server dir>/session.json` | Optional config (quota keys, providerMap). |
-| `ZCODE_SESSION_CLI` | `E:\zcode\resources\glm\zcode.cjs` | zcode CLI entry (headless channel). |
-| `ZCODE_SESSION_NODE` | `process.execPath` | Node executable for headless children (>= 22.5). |
+| `ZCODE_SESSION_NODE` | `process.execPath` | Node executable for background job children (>= 22.5). |
 | `ZCODE_SESSION_QUOTA_BASE` | Zhipu endpoint | Quota API base. |
 | `ZCODE_SESSION_PLAN_BASE` | `https://zcode.z.ai` | start plan / reset card API base. |
 | `ZCODE_SESSION_APP_VERSION` | `3.14.4` | `app_version` sent to zcode.z.ai (server validates it — keep in sync with the client). |
@@ -121,6 +120,8 @@ Then register with your MCP client.
 ## History
 
 This is the renamed, expanded successor of `zcode-fleet-mcp` (a cross-session "fleet" tool). Session CRUD was rebuilt on top of a source-level study of the ZCode client's own session store; the old `fleet_*` tool names and legacy config fallback were removed — use the `session_*` tools and `session.json`.
+
+**v0.3.0** — the zcode CLI headless channel (`ZCODE_SESSION_CLI` / `native: false`) was removed entirely. `session_run` / `session_send` now go through the desktop scheduler's native channel only (real `createTask`/`resumeTask`+`sendPrompt`, live sidebar status, per-model injection via `session_model`).
 
 ## Disclaimer
 

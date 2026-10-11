@@ -8,7 +8,7 @@
     "url": "https://github.com/Aelindra/zcode-session-mcp",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "0.3.0",
   "authors": [
     {
       "name": "Aelindra"
@@ -30,7 +30,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "zcode-session-mcp",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },
@@ -42,14 +42,8 @@
           "isSecret": false
         },
         {
-          "name": "ZCODE_SESSION_CLI",
-          "description": "Path to zcode.cjs for the headless channel (native scheduler channel needs no CLI)",
-          "isRequired": false,
-          "isSecret": false
-        },
-        {
           "name": "ZCODE_SESSION_NODE",
-          "description": "Node >= 22.5 executable for headless children (defaults to the server's own runtime)",
+          "description": "Node >= 22.5 executable for background job children (defaults to the server's own runtime)",
           "isRequired": false,
           "isSecret": false
         }
