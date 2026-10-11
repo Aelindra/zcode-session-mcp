@@ -1767,14 +1767,16 @@ async function planClaim(args) {
     const captcha = String(args.captchaVerifyParam || "").trim();
     if (!captcha) {
       return errResult("CLAIM_CAPTCHA_REQUIRED",
-        "领取强制阿里云人机验证（X-Aliyun-Captcha-Verify-Param），无法全自动。两条路：① 在 ZCode 客户端领取弹窗里完成验证点击领取（最省事）；"
-        + "② 在浏览器登录 zcode.z.ai 完成验证码后，把拿到的 captchaVerifyParam 作为本参数传入重试。claim body={plan_id}，验证码参数有时效。",
+        "领取强制阿里云人机验证（X-Aliyun-Captcha-Verify-Param），无法纯 API 全自动。全自动路径见 README「自动领取」：受控页面加载 AliyunCaptcha.js（须先设 window.AliyunCaptchaConfig={region,prefix}，用 plan_start 场景配置），startTracelessVerification() 无感通过后抓 captchaVerifyParam 传入本工具。"
+        + "也可在 ZCode 客户端领取弹窗完成验证。claim body={plan_id}，验证码参数有时效且一次性。",
         { planId });
     }
+    // region 头是命门：实测缺了它服务端 VerifyIntelligentCaptcha 必失败（3007），带上才进入业务校验
+    const captchaRegion = String(args.captchaRegion || "cn").trim();
     try {
       const r = await zcodePlanApi("/api/v1/zcode-plan/billing/claim", {
         method: "POST",
-        headers: { ...headers, "Content-Type": "application/json", "X-Aliyun-Captcha-Verify-Param": captcha },
+        headers: { ...headers, "Content-Type": "application/json", "X-Aliyun-Captcha-Verify-Param": captcha, "X-Aliyun-Captcha-Verify-Region": captchaRegion },
         body: { plan_id: planId },
       });
       const d = r.json.data || {};
@@ -1785,7 +1787,7 @@ async function planClaim(args) {
         note: d.plan ? "领取成功：plan_start 复核新套餐与余额。" : `服务端未返回 plan（code=${r.json.code} ${r.json.msg || ""}），以 plan_start 复核为准。`,
       });
     } catch (e) {
-      return errResult("CLAIM_FAILED", errText(e) + (e.businessCode ? "（验证码参数可能已过期，重新获取后重试）" : ""), { planId });
+      return errResult("CLAIM_FAILED", errText(e) + (e.businessCode === 3007 ? "（captcha verify failed：参数过期/已用/缺 Region 头——参数一次性，重新抓）" : e.businessCode ? "（验证码参数可能已过期，重新获取后重试）" : ""), { planId });
     }
   }
 
@@ -2037,13 +2039,14 @@ const TOOLS = [
   },
   {
     name: "plan_claim",
-    description: "start plan 领取面：action=preview 列出当前可领取的活动套餐（可配合定时任务轮询）；action=claim 按 plan_id 领取——服务端强制阿里云人机验证，需传 captchaVerifyParam（客户端弹窗完成验证最省事，无法全自动）。Manual-claim plan preview / claim (captcha-gated).",
+    description: "start plan 领取面：action=preview 列出当前可领取的活动套餐（可配合定时任务轮询）；action=claim 按 plan_id 领取——服务端强制阿里云人机验证，需传 captchaVerifyParam（无感验证抓参法见 README「自动领取」；缺 X-Aliyun-Captcha-Verify-Region 头必 3007）。Manual-claim plan preview / claim (captcha-gated).",
     inputSchema: {
       type: "object",
       properties: {
         action: { type: "string", enum: ["preview", "claim"], description: "默认 preview" },
         planId: { type: "string", description: "claim 时的 plan_id（preview 返回）" },
-        captchaVerifyParam: { type: "string", description: "claim 必填：阿里云验证码 verify 参数（有时效）" },
+        captchaVerifyParam: { type: "string", description: "claim 必填：阿里云验证码 verify 参数（一次性，有时效）" },
+        captchaRegion: { type: "string", description: "验证码 region，默认 cn（对应 X-Aliyun-Captcha-Verify-Region 头，必带）" },
       },
     },
   },
