@@ -3,7 +3,7 @@
 //
 // 纯 Node.js 单文件、零依赖；要求 node >= 22.5（node:sqlite）。运行/注入只走客户端原生通道（桌面调度器 automations 表）。
 // 能力对照 zcode 客户端源码（apps/zcode-cli）的会话管理面：
-//   查: session_list / session_get / session_messages / session_search / session_status
+//   查: session_list / session_get / session_messages / session_export / session_search / session_status
 //   增: session_create（落 session 行，复刻 ensureSessionPersisted 语义）/ session_run（跑一个新会话）
 //   改: session_rename / session_pin / session_archive / session_model / session_send
 //   删: session_delete（默认软删=tasks-index tombstone；hard=true 真删，FK/显式级联）
@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID, createHash, createDecipheriv } from "node:crypto";
 import process from "node:process";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const DB_TASKS_TIMEOUT_MS = 5000;
 // scheduler 每 20s 轮询 automations（packages/desktop/src/scheduler）；misfire 宽限 5 分钟，
 // 插行的 next_run_at 必须 ≈ now，否则被判"错过窗口"直接跳过。
@@ -552,6 +552,161 @@ function sessionMessages(args) {
   } finally { try { db.close(); } catch { /* noop */ } }
 }
 
+// ---------------------------------------------------------------- session_export（原样导出 + 分片）
+
+// 启发式估 token：ASCII≈4字符/token，CJK/全角≈1字符/token；仅用于切片粒度，非精确计数
+function estimateTokens(text) {
+  let ascii = 0, wide = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cp = text.codePointAt(i);
+    if (cp > 0xffff) i++;
+    if (cp >= 0x2e80) wide++; else ascii++;
+  }
+  return Math.ceil(ascii / 4 + wide);
+}
+
+const EXPORT_TOOL_PREVIEW = 2000; // txt 格式工具 input/output 概览截断长度（全量走 jsonl）
+function exportPreview(v, cap = EXPORT_TOOL_PREVIEW) {
+  const s = typeof v === "string" ? v : JSON.stringify(v, null, 1);
+  if (s === undefined || s === null) return "";
+  return s.length > cap ? s.slice(0, cap) + "…[截断，全量见 jsonl 导出]" : s;
+}
+
+function sessionExport(args) {
+  const need = requireSession(args.sessionId);
+  if (need.error) return need.error;
+  const sessionId = args.sessionId;
+  const format = String(args.format || "jsonl").toLowerCase();
+  if (!["jsonl", "txt"].includes(format)) return errResult("BAD_ARGS", `format 只支持 jsonl | txt（收到 ${args.format}）`);
+  const chunk = args.chunk === undefined ? true : Boolean(args.chunk);
+  const includeReasoning = Boolean(args.includeReasoning);
+  const chunkTokens = Math.min(Math.max(Number(args.chunkTokens) || 100000, 1000), 1000000);
+  const overwrite = Boolean(args.overwrite);
+  const outputDir = String(args.outputDir || "").trim() || join(SCRIPT_DIR, "exports", sessionId, format);
+
+  let db;
+  try { db = openDbRo(DB_MAIN); } catch (e) { return errResult("DB_OPEN_FAILED", errText(e)); }
+  try {
+    const s = getSessionRow(db, sessionId);
+    // 排序对齐客户端 messages()：(sequence, time_created, id)
+    const rows = db.prepare(`
+      SELECT id, data, sequence, time_created FROM message
+      WHERE session_id = ? ORDER BY sequence, time_created, id`).all(sessionId);
+    const partStmt = db.prepare("SELECT data FROM part WHERE message_id = ? ORDER BY sequence, time_created, id");
+    const messages = rows.map((r) => {
+      let data = {};
+      try { data = JSON.parse(r.data); } catch { /* 坏行保底 */ }
+      const parts = partStmt.all(r.id).map((p) => { try { return JSON.parse(p.data); } catch { return null; } }).filter(Boolean);
+      return { id: r.id, role: data.role || null, time_created: r.time_created, sequence: r.sequence, data, parts };
+    });
+
+    // 渲染为字符串序列：jsonl=每消息一行库内原样 JSON；txt=普通会话式块
+    const sep = "─".repeat(48);
+    const render = (m, no) => {
+      if (format === "jsonl") {
+        return JSON.stringify({
+          message_id: m.id, role: m.role,
+          time_created: m.time_created ? new Date(m.time_created).toISOString() : null,
+          sequence: m.sequence, data: m.data, parts: m.parts,
+        });
+      }
+      const out = [`[${String(no).padStart(3, "0")}] ${m.role || "?"} · ${m.time_created ? new Date(m.time_created).toISOString() : "?"}`];
+      for (const p of m.parts) {
+        if (!p || typeof p !== "object") continue;
+        if ((p.type === "text" || p.type === "reasoning") && p.text) {
+          if (p.type === "reasoning" && !includeReasoning) continue;
+          out.push("", p.text);
+        } else if (p.type === "tool") {
+          const st = p.state || {};
+          out.push("", `  [tool] ${p.tool || p.toolName || "?"} · ${st.status || "?"}`);
+          if (st.input !== undefined && st.input !== null) out.push(`  input : ${exportPreview(st.input)}`);
+          if (st.output !== undefined && st.output !== null) out.push(`  output: ${exportPreview(st.output)}`);
+        }
+      }
+      return out.join("\n");
+    };
+    const renders = messages.map((m, i) => render(m, i + 1));
+
+    if (existsSync(outputDir) && readdirSync(outputDir).length && !overwrite) {
+      return errResult("OUTPUT_DIR_NOT_EMPTY", `输出目录已存在且非空: ${outputDir}（overwrite=true 覆盖本工具产物）`);
+    }
+    mkdirSync(outputDir, { recursive: true });
+    if (overwrite) {
+      // 只清理本工具命名模式的产物，不碰目录里其他内容
+      const ours = /^(part-\d+\.(jsonl|txt)|manifest\.json|sess_[A-Za-z0-9-]+\.(jsonl|txt))$/;
+      for (const f of readdirSync(outputDir)) if (ours.test(f)) { try { rmSync(join(outputDir, f)); } catch { /* noop */ } }
+    }
+
+    const joiner = format === "jsonl" ? "\n" : `\n\n${sep}\n\n`;
+    const txtHeader = format === "txt" ? [
+      "# ZCode 会话导出（txt 普通对话式）",
+      `标题: ${s.title}`,
+      `会话: ${sessionId}`,
+      `目录: ${s.directory || "?"}`,
+      `消息数: ${rows.length}`,
+      `时间: ${s.time_created ? new Date(s.time_created).toISOString() : "?"} ~ ${s.time_updated ? new Date(s.time_updated).toISOString() : "?"}`,
+      `生成: ${new Date().toISOString()}`,
+      `说明: 正文全量；reasoning 按 includeReasoning=${includeReasoning}；工具 input/output 各截 ${EXPORT_TOOL_PREVIEW} 字符（全量原样用 jsonl 格式）`,
+    ].join("\n") : null;
+
+    // 切片：消息原子，单条超限独占一片；chunk=false 时单文件
+    let groups;
+    if (!chunk) {
+      groups = [{ items: renders, tokens: renders.reduce((a, x) => a + estimateTokens(x), 0) }];
+    } else {
+      groups = [];
+      let cur = { items: [], tokens: 0 };
+      const flush = () => { if (cur.items.length) { groups.push(cur); cur = { items: [], tokens: 0 }; } };
+      for (const text of renders) {
+        const t = estimateTokens(text);
+        if (cur.items.length && cur.tokens + t > chunkTokens) flush();
+        cur.items.push(text);
+        cur.tokens += t;
+      }
+      flush();
+    }
+
+    const files = groups.map((g, i) => {
+      const name = chunk ? `part-${String(i + 1).padStart(3, "0")}.${format}` : `${sessionId}.${format}`;
+      let content = g.items.join(joiner) + "\n";
+      if (format === "txt") content = (i === 0 ? txtHeader + "\n\n" : `（会话 ${sessionId} · 第 ${i + 1}/${groups.length} 片）\n\n`) + content;
+      const p = join(outputDir, name);
+      writeFileSync(p, content, "utf8");
+      return { file: name, path: p, messages: g.items.length, estTokens: g.tokens, bytes: statSync(p).size };
+    });
+
+    const manifest = {
+      tool: "session_export", version: VERSION,
+      sessionId,
+      title: s.title, directory: s.directory,
+      time_created: s.time_created ? new Date(s.time_created).toISOString() : null,
+      time_updated: s.time_updated ? new Date(s.time_updated).toISOString() : null,
+      generatedAt: new Date().toISOString(),
+      sourceDb: DB_MAIN,
+      format, chunk, chunkTokens, includeReasoning,
+      formatDesc: format === "jsonl"
+        ? "jsonl（每行一条消息：message_id/role/time_created/sequence/data/parts，data 与 parts 为库内原样 JSON）"
+        : `txt（普通会话式：消息头+正文全量+工具 input/output 概览各截 ${EXPORT_TOOL_PREVIEW} 字符）`,
+      msgCount: rows.length,
+      estTokensTotal: files.reduce((a, f) => a + f.estTokens, 0),
+      tokenEstimator: "ASCII≈4字符/token，CJK≈1字符/token（切片启发式，非精确）",
+      parts: files,
+    };
+    writeFileSync(join(outputDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+
+    return okResult({
+      ok: true, sessionId, format, chunk, outputDir, msgCount: rows.length,
+      partCount: files.length, chunkTokens, estTokensTotal: manifest.estTokensTotal,
+      parts: files.map((f) => ({ file: f.file, messages: f.messages, estTokens: f.estTokens })),
+      note: format === "jsonl"
+        ? "恢复=按序拼接 part-*.jsonl 后逐行 JSON.parse。"
+        : "txt 为普通对话式阅读版（工具概览有截断）；全量结构化请再导一份 jsonl。",
+    });
+  } catch (e) {
+    return errResult("EXPORT_FAILED", errText(e));
+  } finally { try { db.close(); } catch { /* noop */ } }
+}
+
 // ---------------------------------------------------------------- session_search
 
 function sessionSearch(args) {
@@ -947,9 +1102,12 @@ function nativeAutomationInsert(args) {
   let db;
   try {
     db = openTasksIndexRW();
+    // 自清洁（2026-10-12 修复 AUTOMATION_LIMIT 死锁）：一次性注入行派发完即变 completed 且无人清理，
+    // 攒满 20 条上限后所有后续注入死锁。只删确定死亡行：一次性+已禁用+已完成（pending/recurring 一律不动）。
+    db.prepare("DELETE FROM automations WHERE recurring = 0 AND enabled = 0 AND lifecycle_status = 'completed'").run();
     const cnt = db.prepare("SELECT COUNT(*) AS c FROM automations").get();
     if (Number(cnt.c) >= 20) {
-      return { error: { code: "AUTOMATION_LIMIT", message: "automations 已达 20 条上限（桌面端同款限制），请先在 自动化 页清理后再试" } };
+      return { error: { code: "AUTOMATION_LIMIT", message: "automations 已达 20 条上限（自清洁后仍满：存在大量 pending/active 行），请先在 自动化 页清理后再试" } };
     }
     db.prepare(`INSERT INTO automations (
         automation_id, title, cron_expr, prompt, model, provider, model_selection,
@@ -1433,9 +1591,10 @@ async function planResetCard(args) {
     const d = r.json.data || {};
     const five = (d.available_five_hour_resets || []).map((x) => x.expire_at).filter(Number.isFinite);
     const week = (d.available_week_resets || []).map((x) => x.expire_at).filter(Number.isFinite);
+    const isoAsc = (a) => [...a].sort((x, y) => x - y).map((t) => new Date(t).toISOString());
     return {
-      availableFiveHourResets: { count: five.length, earliestExpireAt: five.length ? new Date(Math.min(...five)).toISOString() : null },
-      availableWeekResets: { count: week.length, earliestExpireAt: week.length ? new Date(Math.min(...week)).toISOString() : null },
+      availableFiveHourResets: { count: five.length, earliestExpireAt: five.length ? new Date(Math.min(...five)).toISOString() : null, cardExpireAts: isoAsc(five) },
+      availableWeekResets: { count: week.length, earliestExpireAt: week.length ? new Date(Math.min(...week)).toISOString() : null, cardExpireAts: isoAsc(week) },
       latestFiveHourResetUsedAt: d.latest_five_hour_reset_history ? new Date(d.latest_five_hour_reset_history.used_at).toISOString() : null,
       latestWeekResetUsedAt: d.latest_week_reset_history ? new Date(d.latest_week_reset_history.used_at).toISOString() : null,
       hasUnreadHistory: Boolean(d.has_unread_history),
@@ -1656,6 +1815,23 @@ const TOOLS = [
     },
   },
   {
+    name: "session_export",
+    description: "会话导出：format=jsonl 结构化原样（每消息一行库内 data+parts 原始 JSON）/ txt 普通对话式（消息头+正文全量，工具概览截断）；chunk 控制是否按估算 token 切片（默认开，100k/片，消息原子；chunk=false 单文件）。Export a session: structured raw JSONL or plain conversational txt; optional ~100k-token chunking (default on).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "sess_* 会话 id" },
+        format: { type: "string", enum: ["jsonl", "txt"], description: "jsonl=结构化原样（默认）；txt=普通对话式" },
+        chunk: { type: "boolean", description: "是否切片，默认 true；false=单文件" },
+        chunkTokens: { type: "number", description: "每片估算 token 上限，默认 100000" },
+        includeReasoning: { type: "boolean", description: "txt 是否含 reasoning 思考文本，默认 false" },
+        outputDir: { type: "string", description: "输出目录，缺省 <server目录>/exports/<sessionId>/<format>" },
+        overwrite: { type: "boolean", description: "输出目录非空时是否清理本工具产物后覆盖，默认拒绝" },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
     name: "session_search",
     description: "跨会话搜索：标题和/或消息正文 LIKE 匹配，返回命中会话+消息上下文摘要。Search across sessions by keyword.",
     inputSchema: {
@@ -1804,7 +1980,7 @@ const TOOLS = [
   },
   {
     name: "plan_reset_card",
-    description: "智谱重置卡：action=status 查看库存（5小时窗/周窗各几张、到期时间、最近使用历史）；action=use 消费一张立即重置对应额度窗口（需 confirm=true，resetType=FIVE_HOUR|WEEK，幂等键自动生成）；action=opportunity 手动触发一次领卡机会（客户端本就自动轮询，勿循环调用）；action=history_read 标记历史已读。Coding-plan reset cards: status / use (confirm-gated) / opportunity / history read.",
+    description: "智谱重置卡。**须桌面端登录**：凭据取自 ~/.zcode/v2/credentials.json 的 zcodejwttoken，账户绑定该登录态——session.json 里的 API key 既查不了本功能也不能切换账户。action=status 查看库存（5小时窗/周窗逐卡 expire_at、最近使用历史）；action=use 消费一张立即重置对应额度窗口（需 confirm=true，resetType=FIVE_HOUR|WEEK，幂等键自动生成）；action=opportunity 手动触发一次领卡机会（客户端本就自动轮询，勿循环调用）；action=history_read 标记历史已读。Coding-plan reset cards (desktop login REQUIRED; API keys cannot query or switch accounts): status / use (confirm-gated) / opportunity / history read.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1843,6 +2019,7 @@ function dispatch(name, args) {
     case "session_list": return Promise.resolve(listSessions(args || {}));
     case "session_get": return Promise.resolve(sessionGet(args || {}));
     case "session_messages": return Promise.resolve(sessionMessages(args || {}));
+    case "session_export": return Promise.resolve(sessionExport(args || {}));
     case "session_search": return Promise.resolve(sessionSearch(args || {}));
     case "session_create": return Promise.resolve(sessionCreate(args || {}));
     case "session_rename": return Promise.resolve(sessionRename(args || {}));

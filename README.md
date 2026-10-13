@@ -66,6 +66,7 @@ Then register with your MCP client.
 | `session_list` | Recent sessions with message counts, liveness (active in last 10 min), sidebar state (pinned/archived/deleted), model, automation binding. Filters: keyword, directory, include subagents/archived/deleted. |
 | `session_get` | One session in full: fields, message stats, saved model selection (the real source in `session_entry`), token usage, todos, goal heartbeat, child sessions, background agents, model-io/artifact files, sidebar state, running heuristic. |
 | `session_messages` | Read messages (client-ordered by `sequence, time_created, id`). `compact` format = role + text + tool summaries; `raw` = original JSON. Tail pagination, role filter, optional reasoning. |
+| `session_export` | Export a session: `format=jsonl` structured verbatim (one message per line, raw `data` + `parts` JSON) or `format=txt` plain conversational (full text, tool previews, optional reasoning). `chunk` splits at ~100k estimated tokens (default on, message-atomic); `chunk=false` writes a single file. Output defaults to `<server dir>/exports/<sessionId>/<format>/` with a `manifest.json`; refuses a non-empty dir unless `overwrite` (which only clears this tool's own files). |
 | `session_search` | Keyword search across session titles and/or message bodies with context snippets. |
 | `session_status` | Liveness: background agents dir + child sessions + last-message window + sidebar status cross-check. |
 
@@ -93,9 +94,11 @@ Then register with your MCP client.
 | --- | --- |
 | `plan_quota` | *Optional.* Zhipu/Z.ai coding-plan usage (5-hour & weekly windows) via `open.bigmodel.cn`, authenticated with an `apiKey` from `session.json` `keys`. Returns guidance when unconfigured. |
 | `plan_start` | View the ZCode **start plan** account face (`zcode.z.ai`): active subscriptions, per-model balance buckets (total/used/remaining/expiry), and currently claimable plans. Credentials are decrypted from the desktop login store `~/.zcode/v2/credentials.json` (same `enc:v1` AES-256-GCM scheme as the client — nothing is sent anywhere except `zcode.z.ai`). |
-| `plan_reset_card` | Coding-plan **reset cards**: `status` (inventory of 5-hour/weekly cards + usage history), `use` (consume one card to instantly reset that window — **confirm-gated**, `resetType=FIVE_HOUR\|WEEK`, idempotency key auto-generated), `opportunity` (trigger one card-grant chance; the desktop client already polls this itself — don't loop it), `history_read`. |
+| `plan_reset_card` | Coding-plan **reset cards** — **desktop login required** (reads `zcodejwttoken` from `~/.zcode/v2/credentials.json`; the account is bound to that login — `session.json` API keys can neither query this nor switch accounts). `status`: inventory with per-card `expire_at` + latest usage history; `use`: consume one card to instantly reset that window (**confirm-gated**, `resetType=FIVE_HOUR\|WEEK`, idempotency key auto-generated); `opportunity`: trigger one card-grant chance (the desktop client already polls this itself — don't loop it); `history_read`. |
 | `plan_claim` | Manual-claim plan face: `preview` lists currently claimable plans (safe to poll on a schedule); `claim` requires the Aliyun **captcha** verify param — the server enforces human verification, so fully-automatic claiming is impossible by design; the ZCode client's claim dialog is the easy path. |
 | `plan_switch` | View/switch which `session.json` key alias is `current` (the one `plan_quota` queries by default). Local config only — does not touch ZCode client providers. |
+
+**Two auth domains in this section** — `plan_quota` / `plan_switch` talk to `open.bigmodel.cn` with plain API keys from `session.json` (multi-account friendly: one alias per account). `plan_start` / `plan_reset_card` / `plan_claim` talk to `zcode.z.ai` with the **desktop login's** JWTs (`zcodejwttoken` + bigmodel oauth token) and always follow whichever account is logged in on the desktop — API keys do not work there. To inspect another account's reset cards, log that account in on the desktop and query, or snapshot its decrypted `zcodejwttoken` for offline reuse (login JWTs carry no `exp` claim; on 401, log in again to refresh).
 
 ## Semantics worth knowing
 
@@ -122,6 +125,8 @@ Then register with your MCP client.
 This is the renamed, expanded successor of `zcode-fleet-mcp` (a cross-session "fleet" tool). Session CRUD was rebuilt on top of a source-level study of the ZCode client's own session store; the old `fleet_*` tool names and legacy config fallback were removed — use the `session_*` tools and `session.json`.
 
 **v0.3.0** — the zcode CLI headless channel (`ZCODE_SESSION_CLI` / `native: false`) was removed entirely. `session_run` / `session_send` now go through the desktop scheduler's native channel only (real `createTask`/`resumeTask`+`sendPrompt`, live sidebar status, per-model injection via `session_model`).
+
+**v0.4.0** — new `session_export` tool (structured raw JSONL / plain conversational txt, optional ~100k-token chunking). `plan_reset_card` now returns per-card `expire_at` in `status`, and its docs make the desktop-login requirement explicit (API keys cannot query or switch accounts).
 
 ## Disclaimer
 

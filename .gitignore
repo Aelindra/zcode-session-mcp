@@ -2,6 +2,7 @@
 session.json
 fleet.json
 logs/
+exports/
 *.tmp.mjs
 node_modules/
 .zcode-tmp/
