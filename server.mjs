@@ -24,14 +24,14 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, copyFileSync, renameSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, createHash, createDecipheriv } from "node:crypto";
 import process from "node:process";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const DB_TASKS_TIMEOUT_MS = 5000;
 // scheduler 每 20s 轮询 automations（packages/desktop/src/scheduler）；misfire 宽限 5 分钟，
 // 插行的 next_run_at 必须 ≈ now，否则被判"错过窗口"直接跳过。
@@ -1118,7 +1118,7 @@ function nativeAutomationInsert(args) {
         dispatch_status, dispatch_attempts, retry_at, last_error,
         mode, thought_level, created_at, updated_at
       ) VALUES (
-        ?, ?, '*', ?, NULL, NULL, 'null',
+        ?, ?, '*', ?, NULL, NULL, ?,
         ?, ?, NULL, ?, NULL, 'local',
         0, 1, NULL, NULL, 0,
         0, 1, 'active',
@@ -1127,6 +1127,7 @@ function nativeAutomationInsert(args) {
         ?, NULL, ?, ?
       )`).run(
       automationId, title, args.prompt,
+      args.modelSelectionJson || 'null', // 'null' 字面量=跟随桌面首选；JSON=本次派发的固定 ModelSelection（调度器传 resumeTask，Host 首次有效选择即固定）
       args.cwd, args.cwd, args.targetTaskId || null,
       now - 200, // ≈now：必须落在 misfire 宽限（5 分钟）内
       args.mode || "yolo", now, now,
@@ -1261,23 +1262,95 @@ async function bgRun(jobPath) {
 
 // ---------------------------------------------------------------- session_send（注入提示词）
 
+// —— interrupt 真中断辅助：定位并终止 workspace 宿主（zcode.cjs app-server 子进程）——
+const INFLIGHT_WINDOW_MS = 10 * 60 * 1000; // 与判活同窗：近 10 分钟有新消息视为在飞
+const normDir = (p) => String(p || "").replace(/[\\/]+$/, "").toLowerCase();
+
+function psOut(script, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("powershell", ["-NoProfile", "-Command", script], { windowsHide: true });
+    let out = "", err = "";
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* noop */ } reject(new Error("powershell 超时")); }, timeoutMs);
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => { clearTimeout(timer); reject(e); });
+    child.on("exit", (code) => { clearTimeout(timer); code === 0 ? resolve(out) : reject(new Error(`powershell exit ${code}: ${err.slice(0, 200)}`)); });
+  });
+}
+
+// workspace 宿主 = 命令行含 zcode.cjs app-server 的 ZCode.exe（每 workspace 一个，桌面 NodeService 之子）
+async function listAppServerPids() {
+  try {
+    const out = await psOut(`Get-CimInstance Win32_Process -Filter "Name='ZCode.exe'" | Where-Object { $_.CommandLine -match 'zcode\\.cjs\\s+app-server' } | ForEach-Object { $_.ProcessId }`);
+    return [...new Set(out.split(/\s+/).filter(Boolean).map(Number).filter(Number.isFinite))];
+  } catch { return []; }
+}
+
+async function cpuMs(pid) {
+  const out = await psOut(`(Get-Process -Id ${pid} -ErrorAction Stop).TotalProcessorTime.TotalMilliseconds`);
+  return Number(String(out).trim().replace(/,/g, ".")) || 0;
+}
+
+// CPU 探针：在飞会话的宿主在流式干活（CPU 增量显著），空闲宿主≈0；差距不够=定位失败
+async function findHostPidByCpu(pids, sampleMs = 4000) {
+  if (pids.length === 1) return pids[0];
+  const base = new Map();
+  for (const pid of pids) { try { base.set(pid, await cpuMs(pid)); } catch { base.set(pid, null); } }
+  await new Promise((r) => setTimeout(r, sampleMs));
+  const deltas = [];
+  for (const pid of pids) {
+    const b = base.get(pid);
+    if (b == null) continue;
+    try { deltas.push({ pid, d: (await cpuMs(pid)) - b }); } catch { /* 进程没了 */ }
+  }
+  deltas.sort((a, b) => b.d - a.d);
+  const top = deltas[0], second = deltas[1]?.d ?? 0;
+  return top && top.d > 100 && top.d > second * 2 + 100 ? top.pid : null;
+}
+
+async function killPidTree(pid) {
+  return new Promise((resolve) => {
+    const child = spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { windowsHide: true });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => resolve({ ok: false, out }));
+    child.on("exit", (code) => resolve({ ok: code === 0, out: out.trim() }));
+  });
+}
+
+// 近窗口内有新消息的会话（跨 workspace 全局），用于评估杀宿主的连带面
+function recentActiveSessions(excludeId) {
+  let db;
+  try { db = openDbRo(DB_MAIN); } catch { return []; }
+  try {
+    const since = Date.now() - INFLIGHT_WINDOW_MS;
+    const rows = db.prepare("SELECT session_id, MAX(time_created) AS last_at FROM message WHERE time_created > ? GROUP BY session_id").all(since);
+    const out = [];
+    for (const r of rows) {
+      if (r.session_id === excludeId) continue;
+      const s = getSessionRow(db, r.session_id);
+      if (s) out.push({ sessionId: r.session_id, title: s.title, directory: s.directory, lastAt: r.last_at ? new Date(r.last_at).toISOString() : null });
+    }
+    return out;
+  } catch { return []; }
+  finally { try { db.close(); } catch { /* noop */ } }
+}
+
 async function sessionSend(args) {
   const sessionId = args.sessionId, prompt = args.prompt, mode = args.mode || "append";
   if (!sessionId || !prompt) return errResult("BAD_ARGS", "缺少必填参数 sessionId / prompt");
   if (!["append", "interrupt"].includes(mode)) return errResult("BAD_ARGS", "mode 只支持 append | interrupt");
 
-  // mode=interrupt 语义：会话在飞 → 拒绝注入（避免插队/冲突）；空闲 → 等价 append
-  if (mode === "interrupt") {
-    const st = sessionStatus({ sessionId });
-    let body = {};
-    try { body = JSON.parse(st.content[0].text); } catch { /* ignore */ }
-    if (body.ownActive || body.childSessionsRunning > 0 || body.agentsRunning > 0) {
-      return errResult("REFUSED_ACTIVE",
-        `会话仍在飞（ownActive=${body.ownActive}, childSessionsRunning=${body.childSessionsRunning}, agentsRunning=${body.agentsRunning}），interrupt 注入被拒绝。等其空闲后再试，或改用 mode=append 排队补指令。`);
-    }
+  // 按次模型覆盖：写进注入行 model_selection，派发时由 Host 固定——不受桌面端回写会话选择的竞态影响
+  let modelSelectionJson = null, resolvedModel = null;
+  if (args.modelRef !== undefined) {
+    const r = resolveModelRef(String(args.modelRef));
+    if (!r) return errResult("MODEL_REF_UNRESOLVED", `无法解析模型引用 "${args.modelRef}"`);
+    const tl = String(args.thoughtLevel || "high");
+    modelSelectionJson = JSON.stringify({ providerId: r.providerId, modelId: r.modelId, options: { reasoningLevel: tl } });
+    resolvedModel = { providerId: r.providerId, modelId: r.modelId, thoughtLevel: tl };
   }
 
-  // 原生通道（唯一通道）：target_task_id=sessionId 的一次性自动化行 → 桌面调度器 → host resumeTask+sendPrompt（在飞时原生排队）
   if (!existsSync(DB_TASKS)) return errResult("DB_NOT_FOUND", `未找到 ${DB_TASKS}`);
   let directory = null;
   try {
@@ -1290,6 +1363,62 @@ async function sessionSend(args) {
     } finally { db.close(); }
   } catch (e) { return errResult("DB_OPEN_FAILED", errText(e)); }
   if (!existsSync(directory)) return errResult("CWD_NOT_FOUND", `会话工作目录不存在: ${directory}`);
+
+  // mode=interrupt：在飞 → 先入队注入行，再断宿主；调度器（主进程，宿主外）≤20s 认领 resumeTask 重开并送入新指令
+  if (mode === "interrupt") {
+    const st = sessionStatus({ sessionId });
+    let body = {};
+    try { body = JSON.parse(st.content[0].text); } catch { /* ignore */ }
+    const active = Boolean(body.ownActive || body.childSessionsRunning > 0 || body.agentsRunning > 0);
+
+    if (active) {
+      // 连带面评估：同 workspace 内其他在飞会话会随宿主一起被断
+      const others = recentActiveSessions(sessionId).filter((s) => normDir(s.directory) === normDir(directory));
+      if (others.length && !args.force) {
+        return errResult("REFUSED_ACTIVE",
+          `会话在飞，且同 workspace 还有 ${others.length} 个在飞会话会随宿主中断：`
+          + others.map((s) => `${s.sessionId}（${(s.title || "").slice(0, 40)}）`).join("、")
+          + `。确认连带中断请带 force=true。`,
+          { others });
+      }
+
+      const ins = nativeAutomationInsert({ prompt, cwd: directory, targetTaskId: sessionId, modelSelectionJson });
+      if (ins.error) return errResult(ins.error.code, ins.error.message);
+
+      const hostPids = await listAppServerPids();
+      let killed = null, hostNote;
+      if (!hostPids.length) {
+        hostNote = "未发现 app-server 宿主（可能刚退出）：注入行已入队，派发时会自动重开宿主，无需中断。";
+      } else {
+        const hostPid = await findHostPidByCpu(hostPids);
+        if (!hostPid) {
+          hostNote = `有 ${hostPids.length} 个宿主但 CPU 探针无法定位目标（目标可能在等模型响应、CPU 增量不明显）：注入行保持排队，等当前回合自然结束后照常送入（退化为排队注入）。可稍后重试 interrupt。`;
+        } else {
+          const kr = await killPidTree(hostPid);
+          killed = kr.ok ? hostPid : null;
+          hostNote = kr.ok
+            ? `已断宿主 pid=${hostPid}（连带其 MCP 子进程）。调度器 ≤20s 认领注入行并重开宿主送入新指令。`
+            : `taskkill 失败（${(kr.out || "exit!=0").slice(0, 120)}）：注入行保持排队，退化为排队注入。`;
+        }
+      }
+
+      // 等待派发确认（调用方若与目标同 workspace，会在断宿主时一并掉线——后台复核）
+      let dispatch = null;
+      if (args.wait !== false && killed) {
+        dispatch = await nativeDispatchWait(ins.automationId, args);
+      }
+      return okResult({
+        ok: true, mode: "interrupt", sessionId, directory,
+        queued: true, automationId: ins.automationId,
+        model: resolvedModel,
+        killedHostPid: killed, hostNote,
+        dispatch: dispatch ? { ok: dispatch.ok, sessionId: dispatch.sessionId, pending: dispatch.pending || false, error: dispatch.error?.code || null } : null,
+        note: "interrupt 语义：注入行先入队（调度器在主进程不受断宿主影响），随后断宿主中止当前回合；若调用方与目标同 workspace，本次调用连接可能随宿主一起断开，用 resultPath / session_list 复核。",
+      });
+    }
+    // 空闲 → 等价 append，走下方常规派发
+  }
+
   if (!Boolean(args.wait)) {
     const jb = launchBackground("send", args);
     return okResult({
@@ -1298,11 +1427,11 @@ async function sessionSend(args) {
       note: "原生注入已受理（后台插 automations 行并等调度器认领派发）。复核：Read resultPath；侧栏该会话会实时显示运行状态。",
     });
   }
-  const result = await nativeDispatch({ prompt, targetTaskId: sessionId, cwd: directory, claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
+  const result = await nativeDispatch({ prompt, targetTaskId: sessionId, cwd: directory, modelSelectionJson, claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
   if (result.content) {
     try {
       const body = JSON.parse(result.content[0].text);
-      if (body.ok) body.directory = directory;
+      if (body.ok) { body.directory = directory; if (resolvedModel) body.model = resolvedModel; }
     } catch { /* noop */ }
   }
   return result;
@@ -1772,6 +1901,174 @@ function planSwitch(args) {
 
 // ---------------------------------------------------------------- MCP stdio 层
 
+// ---------------------------------------------------------------- Provider 管理（v2/provider_config.json，桌面端「管理模型」面板真源）
+// 源码对齐 zai-org/ZCode：packages/provider/src/config/{provider-data-schema,rule-data-schema}.ts（zod .strict()，多一字段即拒）
+// packages/provider-node/src/provider-config-file-codec.ts（schemaVersion=1）；每次派发经 provisioning envelope 喂给运行时 → 写入后下个会话即生效。
+
+const PROVIDER_CONFIG_FILE = join(ZCODE_HOME, "v2", "provider_config.json");
+const PROVIDER_API_TYPES = ["anthropic-messages", "openai-chat-completions", "openai-responses"];
+const PROVIDER_ACCESS_TYPES = ["api-key", "zhipu-coding-plan-api-key"];
+const maskKey = (k) => (typeof k === "string" && k ? `…${k.slice(-4)}(len=${k.length})` : null);
+
+function loadProviderConfigFile() {
+  if (!existsSync(PROVIDER_CONFIG_FILE)) return { schemaVersion: 1, config: { providerConfigRules: { providerRules: [] }, modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] } } };
+  const doc = JSON.parse(readFileSync(PROVIDER_CONFIG_FILE, "utf8"));
+  if (doc.schemaVersion !== 1) throw new Error(`provider_config.json schemaVersion=${doc.schemaVersion}，本工具仅支持 1`);
+  doc.config ??= {};
+  doc.config.providerConfigRules ??= {};
+  doc.config.providerConfigRules.providerRules ??= [];
+  doc.config.modelConfigRules ??= {};
+  doc.config.modelConfigRules.providerModelRules ??= [];
+  doc.config.modelConfigRules.manualProviderModelRules ??= [];
+  return doc;
+}
+
+function saveProviderConfigFile(doc) {
+  // 只回写 schema 允许的四个 config 键；先备份再 tmp+rename 原子落盘
+  const out = { schemaVersion: 1, config: {} };
+  for (const k of ["providerOrder", "providerConfigRules", "modelConfigRules", "defaultModelSelection"]) {
+    if (doc.config[k] !== undefined) out.config[k] = doc.config[k];
+  }
+  const backup = join(dirname(PROVIDER_CONFIG_FILE), `provider_config.backup-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}.json`);
+  copyFileSync(PROVIDER_CONFIG_FILE, backup);
+  const tmp = PROVIDER_CONFIG_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(out, null, 2) + "\n", "utf8");
+  renameSync(tmp, PROVIDER_CONFIG_FILE);
+  return backup;
+}
+
+function findPersonalRule(doc, id) {
+  return doc.config.providerConfigRules.providerRules.find((r) => r.providerId === id) || null;
+}
+
+function providerList() {
+  let doc;
+  try { doc = loadProviderConfigFile(); } catch (e) { return errResult("PROVIDER_CONFIG_INVALID", errText(e)); }
+  const personal = doc.config.providerConfigRules.providerRules.map((r) => ({
+    providerId: r.providerId, providerName: r.providerName ?? null, templateId: r.templateId ?? null,
+    enabled: r.enabled !== false, group: r.config?.group ?? null,
+    accessType: r.config?.access?.type ?? null,
+    apiKeyMasked: maskKey(r.config?.access?.apiKey),
+    apiType: r.config?.api?.type ?? null, baseUrl: r.config?.api?.baseUrl ?? null,
+    personalModelIds: r.config?.personalModelIds ?? null, modelOrder: r.config?.modelOrder ?? null,
+    builtinModelIds: r.config?.builtinModelIds ?? null,
+  }));
+  let registry = [];
+  try {
+    const cfg = JSON.parse(readFileSync(V2_CONFIG, "utf8"));
+    registry = Object.entries(cfg.provider || {}).map(([pid, p]) => ({ providerId: pid, models: Object.keys((p && p.models) || {}) }));
+  } catch { /* registry 读取失败不阻塞 personal 展示 */ }
+  return okResult({
+    ok: true, personal, registry,
+    note: "personal=「管理模型」面板真源（可增删改，key 已脱敏）；registry=桌面端解析后的模型注册表（只读展示）。改动对下一个派发的会话生效；桌面端 UI 里保存模型设置可能以其内存态覆盖外部写入。",
+  });
+}
+
+function providerAdd(args) {
+  const apiKey = String(args.apiKey || "").trim();
+  if (!apiKey) return errResult("BAD_ARGS", "apiKey 必填");
+  const accessType = String(args.accessType || "api-key");
+  if (!PROVIDER_ACCESS_TYPES.includes(accessType)) return errResult("BAD_ARGS", `accessType 只支持 ${PROVIDER_ACCESS_TYPES.join(" | ")}`);
+  const id = String(args.id || "").trim() || randomUUID();
+  if (/^(builtin:|account:)/.test(id)) return errResult("BAD_ARGS", "providerId 不能使用 builtin:/account: 前缀（保留给内建账号面）");
+
+  let doc;
+  try { doc = loadProviderConfigFile(); } catch (e) { return errResult("PROVIDER_CONFIG_INVALID", errText(e)); }
+  if (findPersonalRule(doc, id)) return errResult("PROVIDER_EXISTS", `providerId ${id} 已存在（改用 provider_set）`);
+
+  let rule;
+  const templateId = String(args.templateId || "").trim();
+  if (templateId) {
+    // 模板型（如 zai-api）：模型与 endpoint 继承模板，只填 access
+    rule = {
+      providerId: id, templateId,
+      ...(String(args.name || "").trim() ? { providerName: String(args.name).trim() } : {}),
+      config: { group: "standard-personal", access: { type: accessType, apiKey } },
+    };
+  } else {
+    // 自定义型：需要 baseUrl + models
+    const baseUrl = String(args.baseUrl || "").trim();
+    const models = Array.isArray(args.models) ? args.models.map((m) => String(m).trim()).filter(Boolean) : [];
+    if (!baseUrl) return errResult("BAD_ARGS", "自定义 provider 必填 baseUrl（或给 templateId 走模板）");
+    if (!models.length) return errResult("BAD_ARGS", "自定义 provider 必填 models（非空数组）");
+    const apiType = String(args.apiType || "anthropic-messages");
+    if (!PROVIDER_API_TYPES.includes(apiType)) return errResult("BAD_ARGS", `apiType 只支持 ${PROVIDER_API_TYPES.join(" | ")}`);
+    rule = {
+      providerId: id,
+      ...(String(args.name || "").trim() ? { providerName: String(args.name).trim() } : {}),
+      config: {
+        group: "standard-personal", access: { type: accessType, apiKey },
+        api: { type: apiType, baseUrl },
+        personalModelIds: models, modelOrder: Array.isArray(args.modelOrder) && args.modelOrder.length ? args.modelOrder.map((m) => String(m).trim()) : models,
+      },
+    };
+  }
+  doc.config.providerConfigRules.providerRules.push(rule);
+  let backup;
+  try { backup = saveProviderConfigFile(doc); } catch (e) { return errResult("PROVIDER_SAVE_FAILED", errText(e)); }
+  return okResult({
+    ok: true, providerId: id, apiKeyMasked: maskKey(apiKey), backup,
+    note: "已写入 provider_config.json（原文件已备份）。下一个派发的会话经 provisioning 生效；注入前用 session_model 把会话路由到该 provider（modelRef 传 \"<providerId>/<modelId>\"）。",
+  });
+}
+
+function providerSet(args) {
+  const id = String(args.id || "").trim();
+  if (!id) return errResult("BAD_ARGS", "缺少必填参数 id");
+  let doc;
+  try { doc = loadProviderConfigFile(); } catch (e) { return errResult("PROVIDER_CONFIG_INVALID", errText(e)); }
+  const rule = findPersonalRule(doc, id);
+  if (!rule) return errResult("PROVIDER_NOT_FOUND", `personal 规则中不存在 ${id}（builtin:/account: 账号面不可经此修改）`);
+  rule.config ??= {};
+
+  if (args.name !== undefined) { if (String(args.name).trim()) rule.providerName = String(args.name).trim(); else delete rule.providerName; }
+  if (args.enabled !== undefined) { if (args.enabled === false) rule.enabled = false; else delete rule.enabled; }
+  if (args.apiKey !== undefined) {
+    const k = String(args.apiKey).trim();
+    if (!k) return errResult("BAD_ARGS", "apiKey 不能为空串（移除 provider 用 provider_remove）");
+    rule.config.access = { ...(rule.config.access || { type: "api-key" }), type: rule.config.access?.type || "api-key", apiKey: k };
+  }
+  if (args.baseUrl !== undefined || args.apiType !== undefined) {
+    const api = { ...(rule.config.api || {}) };
+    if (args.baseUrl !== undefined) api.baseUrl = String(args.baseUrl).trim();
+    if (args.apiType !== undefined) {
+      if (!PROVIDER_API_TYPES.includes(args.apiType)) return errResult("BAD_ARGS", `apiType 只支持 ${PROVIDER_API_TYPES.join(" | ")}`);
+      api.type = args.apiType;
+    } else if (!api.type) api.type = "anthropic-messages";
+    rule.config.api = api;
+  }
+  if (args.models !== undefined) {
+    const models = Array.isArray(args.models) ? args.models.map((m) => String(m).trim()).filter(Boolean) : [];
+    if (!models.length) return errResult("BAD_ARGS", "models 不能为空数组");
+    rule.config.personalModelIds = models;
+    if (args.modelOrder === undefined) rule.config.modelOrder = models;
+  }
+  if (args.modelOrder !== undefined) rule.config.modelOrder = Array.isArray(args.modelOrder) ? args.modelOrder.map((m) => String(m).trim()) : undefined;
+
+  let backup;
+  try { backup = saveProviderConfigFile(doc); } catch (e) { return errResult("PROVIDER_SAVE_FAILED", errText(e)); }
+  return okResult({
+    ok: true, providerId: id, updated: { name: args.name, enabled: args.enabled, apiKey: args.apiKey ? maskKey(String(args.apiKey)) : undefined, baseUrl: args.baseUrl, apiType: args.apiType, models: args.models, modelOrder: args.modelOrder }, backup,
+    note: "已更新并备份。改动对下一个派发的会话生效。",
+  });
+}
+
+function providerRemove(args) {
+  const id = String(args.id || "").trim();
+  if (!id) return errResult("BAD_ARGS", "缺少必填参数 id");
+  if (!args.confirm) return errResult("PROVIDER_REMOVE_REQUIRES_CONFIRM", `remove 会从 provider_config.json 删除该 provider（其 apiKey 随之失效）。确认后带 confirm=true 重试。`);
+  let doc;
+  try { doc = loadProviderConfigFile(); } catch (e) { return errResult("PROVIDER_CONFIG_INVALID", errText(e)); }
+  const before = doc.config.providerConfigRules.providerRules.length;
+  doc.config.providerConfigRules.providerRules = doc.config.providerConfigRules.providerRules.filter((r) => r.providerId !== id);
+  if (doc.config.providerConfigRules.providerRules.length === before) return errResult("PROVIDER_NOT_FOUND", `personal 规则中不存在 ${id}`);
+  doc.config.modelConfigRules.providerModelRules = doc.config.modelConfigRules.providerModelRules.filter((r) => r.providerId !== id);
+  doc.config.modelConfigRules.manualProviderModelRules = doc.config.modelConfigRules.manualProviderModelRules.filter((r) => r.providerId !== id);
+  let backup;
+  try { backup = saveProviderConfigFile(doc); } catch (e) { return errResult("PROVIDER_SAVE_FAILED", errText(e)); }
+  return okResult({ ok: true, providerId: id, removed: true, backup, note: "已删除并清理其模型规则。已派发中的会话不受影响（按派发时的快照跑）。" });
+}
+
 const TOOLS = [
   {
     name: "session_list",
@@ -1938,13 +2235,16 @@ const TOOLS = [
   },
   {
     name: "session_send",
-    description: "向既有会话注入提示词（原生通道）：写 automations 行 → 桌面端 resumeTask+sendPrompt，侧栏实时可见、在飞时原生排队。mode=append 排队补指令；interrupt 在飞时拒绝。按指定模型注入：先 session_model 写会话模型再注入。Send a prompt into an existing session.",
+    description: "向既有会话注入提示词（原生通道）：写 automations 行 → 桌面端 resumeTask+sendPrompt，侧栏实时可见。mode=append 排队补指令（在飞时原生排队）；mode=interrupt 断开式注入——在飞时先入队注入行再断该 workspace 宿主中止当前回合，调度器 ≤20s 重开宿主送入新指令（同 workspace 其他在飞会话会被连带，需 force=true；调用方与目标同 workspace 时自身连接会掉线，用 resultPath 复核）。modelRef=按次模型覆盖（写在注入行 model_selection 上，派发时由 Host 固定，无竞态；格式 providerId/modelId，可配 thoughtLevel）——要在注入前换 key/模型就用它，比 session_model 的会话级写入更可靠。按指定模型注入：先 session_model 写会话模型再注入。Send a prompt into an existing session: append queues natively; interrupt aborts the running turn and injects; modelRef pins the model for this dispatch.",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string", description: "目标会话 id (sess_*)" },
         prompt: { type: "string", description: "要注入的提示词" },
-        mode: { type: "string", enum: ["append", "interrupt"], description: "默认 append" },
+        mode: { type: "string", enum: ["append", "interrupt"], description: "默认 append 排队；interrupt=断开式注入（在飞时断宿主中止当前回合再注入）" },
+        force: { type: "boolean", description: "interrupt 时确认连带中断同 workspace 其他会话" },
+        modelRef: { type: "string", description: "本次派发的模型覆盖（providerId/modelId，写注入行无竞态）；缺省跟随会话/桌面选择" },
+        thoughtLevel: { type: "string", description: "modelRef 的推理档位，默认 high" },
         wait: { type: "boolean", description: "默认 false=受理即返回 resultPath；true=阻塞等跑完" },
         claimTimeoutMs: { type: "number", description: "等认领超时" },
         sessionTimeoutMs: { type: "number", description: "等派发确认超时" },
@@ -2012,6 +2312,60 @@ const TOOLS = [
       properties: { keyAlias: { type: "string", description: "要置为 current 的别名；缺省只列出" } },
     },
   },
+  {
+    name: "provider_list",
+    description: "列出模型 Provider：personal=「管理模型」面板真源 v2/provider_config.json（自定义 provider，key 脱敏显示）；registry=桌面端解析后的模型注册表（只读）。List model providers (personal config + resolved registry).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "provider_add",
+    description: "新增自定义模型 Provider（写入 provider_config.json，原文件先备份）：templateId 走模板（如 zai-api，只填 apiKey）；否则自定义型必填 baseUrl+models。之后 session_model 用 \"<providerId>/<modelId>\" 即可把会话路由到这把 key。Add a custom model provider (backed up, atomic write).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "providerId，缺省自动 UUID；不能用 builtin:/account: 前缀" },
+        name: { type: "string", description: "显示名（如「昵称」）" },
+        templateId: { type: "string", description: "模板型必填（如 zai-api）：模型/endpoint 继承模板" },
+        apiKey: { type: "string", description: "必填：该 provider 的 API key" },
+        accessType: { type: "string", enum: ["api-key", "zhipu-coding-plan-api-key"], description: "默认 api-key" },
+        baseUrl: { type: "string", description: "自定义型必填（如 https://api.z.ai/api/anthropic）" },
+        apiType: { type: "string", enum: ["anthropic-messages", "openai-chat-completions", "openai-responses"], description: "默认 anthropic-messages" },
+        models: { type: "array", items: { type: "string" }, description: "自定义型必填：模型 id 列表" },
+        modelOrder: { type: "array", items: { type: "string" }, description: "展示顺序，缺省同 models" },
+      },
+      required: ["apiKey"],
+    },
+  },
+  {
+    name: "provider_set",
+    description: "更新自定义模型 Provider（换 key、改 baseUrl/apiType、改模型列表、改名、启停）。写入前备份。Update a custom model provider (rotate apiKey, edit models, enable/disable).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "providerId（personal 规则）" },
+        name: { type: "string", description: "显示名" },
+        enabled: { type: "boolean", description: "false=停用（不删）" },
+        apiKey: { type: "string", description: "新 key（轮换）" },
+        baseUrl: { type: "string", description: "endpoint" },
+        apiType: { type: "string", enum: ["anthropic-messages", "openai-chat-completions", "openai-responses"] },
+        models: { type: "array", items: { type: "string" } },
+        modelOrder: { type: "array", items: { type: "string" } },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "provider_remove",
+    description: "删除自定义模型 Provider（confirm 门控；连带清理其模型规则，原文件备份）。在飞会话不受影响。Remove a custom model provider (confirm-gated, backed up).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "providerId" },
+        confirm: { type: "boolean", description: "必填 true 才真删" },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 function dispatch(name, args) {
@@ -2035,6 +2389,10 @@ function dispatch(name, args) {
     case "plan_reset_card": return planResetCard(args || {});
     case "plan_claim": return planClaim(args || {});
     case "plan_switch": return Promise.resolve(planSwitch(args || {}));
+    case "provider_list": return Promise.resolve(providerList());
+    case "provider_add": return Promise.resolve(providerAdd(args || {}));
+    case "provider_set": return Promise.resolve(providerSet(args || {}));
+    case "provider_remove": return Promise.resolve(providerRemove(args || {}));
     default: return Promise.resolve(errResult("UNKNOWN_TOOL", `未知工具: ${name}（本 server 是 zcode-session-mcp，工具列表见 tools/list）`));
   }
 }

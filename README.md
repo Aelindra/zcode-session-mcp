@@ -86,7 +86,7 @@ Then register with your MCP client.
 | Tool | What it does |
 | --- | --- |
 | `session_run` | Start a **new** session with a prompt. Inserts a one-shot row into the desktop scheduler's automations table; the ZCode app (20s polling) picks it up and runs it natively — the session appears live in the sidebar. Returns immediately with a `resultPath` you can read later. |
-| `session_send` | Inject a prompt into an **existing** session via the native channel (desktop `resumeTask`+`sendPrompt`; queues natively while the session is busy). `append` queues; `interrupt` refuses while busy. To run on a specific model, set it first with `session_model` (the native resume honors the session's saved model selection). |
+| `session_send` | Inject a prompt into an **existing** session via the native channel (desktop `resumeTask`+`sendPrompt`; queues natively while the session is busy). `mode=append` queues; `mode=interrupt` aborts-and-injects: queues the automation row first, then kills the workspace's app-server host (CPU-probe identified) to cut the running turn — the scheduler (main process, survives the kill) reopens the host in ≤20s and delivers the new prompt. Other in-flight sessions in the same workspace die with it unless `force: true`; if the caller lives in the same workspace its connection drops too — verify via `resultPath`. `modelRef` (`providerId/modelId` + optional `thoughtLevel`) pins the model **for this dispatch** on the automation row itself — race-free vs the desktop rewriting session-level selections; use it to switch keys/providers per injection. `session_model` remains the session-level persistent choice. |
 
 ### 额度面（Quota / plan）
 
@@ -99,6 +99,19 @@ Then register with your MCP client.
 | `plan_switch` | View/switch which `session.json` key alias is `current` (the one `plan_quota` queries by default). Local config only — does not touch ZCode client providers. |
 
 **Two auth domains in this section** — `plan_quota` / `plan_switch` talk to `open.bigmodel.cn` with plain API keys from `session.json` (multi-account friendly: one alias per account). `plan_start` / `plan_reset_card` / `plan_claim` talk to `zcode.z.ai` with the **desktop login's** JWTs (`zcodejwttoken` + bigmodel oauth token) and always follow whichever account is logged in on the desktop — API keys do not work there. To inspect another account's reset cards, log that account in on the desktop and query, or snapshot its decrypted `zcodejwttoken` for offline reuse (login JWTs carry no `exp` claim; on 401, log in again to refresh).
+
+### Providers（模型 Provider 管理）
+
+| Tool | What it does |
+| --- | --- |
+| `provider_list` | List model providers: `personal` = the desktop "管理模型" panel's source of truth (`~/.zcode/v2/provider_config.json`, custom providers, apiKey masked to last 4) plus the resolved `registry` (read-only). |
+| `provider_add` | Add a custom provider (template path via `templateId` e.g. `zai-api` — just an `apiKey`; or custom path with `baseUrl`+`apiType`+`models`). Atomic write, original file backed up first. Route sessions onto it with `session_model {modelRef: "<providerId>/<modelId>"}`; takes effect on the next dispatched session (runtime providers arrive via provisioning at dispatch). |
+| `provider_set` | Update a custom provider: rotate `apiKey`, edit `baseUrl`/`apiType`/`models`, rename, enable/disable. Backed up. |
+| `provider_remove` | Remove a custom provider (`confirm: true` required; also cleans its model rules). In-flight sessions keep their dispatch-time snapshot. |
+
+Schema-aligned with [zai-org/ZCode](https://github.com/zai-org/ZCode) `packages/provider/src/config/*.ts` (zod strict) and `packages/provider-node/src/provider-config-file-codec.ts` (schemaVersion 1). Caveat: if the desktop UI saves model settings afterwards it writes from its own in-memory state and may override external edits — re-apply via `provider_set` if needed.
+
+Routing note for model refs (`session_send.modelRef` / `session_model`): custom providers route by their own id (`zai-api`, UUIDs); the logged-in plan faces route as `account:bigmodel-individual-coding-plan` / `account:zai-coding-plan`-style ids — the `builtin:*` registry form is rejected at dispatch with「模型选择不可用」. A per-dispatch `modelRef` on the automation row is authoritative (the host pins the first valid selection); session-level `session_model` writes can be overwritten by the desktop's own selection bookkeeping between turns.
 
 ## Semantics worth knowing
 
