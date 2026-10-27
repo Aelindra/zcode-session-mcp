@@ -7,8 +7,9 @@
 //   增: session_create（落 session 行，复刻 ensureSessionPersisted 语义）/ session_run（跑一个新会话）
 //   改: session_rename / session_pin / session_archive / session_model / session_send
 //   删: session_delete（默认软删=tasks-index tombstone；hard=true 真删，FK/显式级联）
-// 额度面: plan_quota（apiKey 额度）/ plan_start（start plan 套餐+余额）/ plan_reset_card（重置卡）
-//         / plan_claim（领取面）/ plan_switch（切 current key）——zcode.z.ai 账号端点+凭据
+// 额度面（默认禁用，session.json "quotaFace": true 或 env ZCODE_SESSION_QUOTA_FACE=1 开启）:
+//   plan_quota（apiKey 额度）/ plan_start（start plan 套餐+余额）/ plan_reset_card（重置卡）
+//   / plan_claim（领取面）/ plan_switch（切 current key）——zcode.z.ai 账号端点+凭据
 //         解密对齐桌面端 app.asar（credentialService enc:v1 AES-256-GCM）
 // 数据层（源码事实层/索引层，均为 WAL 多进程共享）:
 //   ~/.zcode/cli/db/db.sqlite          session/message/part/session_entry/usage 等会话事实
@@ -26,12 +27,12 @@ import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, copyFileSync, renameSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, createHash, createDecipheriv } from "node:crypto";
 import process from "node:process";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const DB_TASKS_TIMEOUT_MS = 5000;
 // scheduler 每 20s 轮询 automations（packages/desktop/src/scheduler）；misfire 宽限 5 分钟，
 // 插行的 next_run_at 必须 ≈ now，否则被判"错过窗口"直接跳过。
@@ -55,6 +56,23 @@ const TELEMETRY_STATE = join(ZCODE_HOME, "v2", "telemetry-state.json");
 const NODE_EXE = process.env.ZCODE_SESSION_NODE || process.execPath;
 const DEFAULT_CWD = join(ZCODE_HOME, "workspace");
 const ACTIVE_WINDOW_MS = 10 * 60 * 1000; // 近10分钟有消息 = 此刻在飞（最可靠判活信号；task_status 可能是崩溃残留）
+// 额度面（plan_*）默认禁用（v0.6.0 起）：会话↔API key 无可靠映射（会话绑定 providerId，keyAlias 是凭据面），
+// 归因价值低且凭据/验证码维护成本高。开启：环境变量 ZCODE_SESSION_QUOTA_FACE=1 或 session.json "quotaFace": true。
+const QUOTA_TOOLS = new Set(["plan_quota", "plan_start", "plan_reset_card", "plan_claim", "plan_switch"]);
+function quotaFaceEnabled() {
+  if (process.env.ZCODE_SESSION_QUOTA_FACE === "1") return true;
+  const { config } = loadConfig(); // 函数声明提升，此处可安全引用
+  return Boolean(config && config.quotaFace === true);
+}
+// workspace 路径必须与客户端逐字节同形（app.asar scheduler/host 的 resolveWorkspaceKey = workspaceIdentity || workspacePath，零归一化）：
+// Windows 上桌面端写/查全是反斜杠原生路径，MCP 落盘若用正斜杠（Git Bash 风格入参），侧栏按 workspace_key 分组查不到、
+// 宿主路由 CronRun 也对不上号——这是 0.16.9→3.16.3 后"会话不可见/派发被挡"的根因。
+const WIN32 = platform() === "win32";
+// 调度器 misfire 宽限 5 分钟（app.asar scheduler Koe=5*6e4）：认领/重试时 next_run_at 距今超宽限，一次性任务被永久跳过。
+const MISFIRE_GRACE_MS = 5 * 60 * 1000;
+// 注入行 keepalive：桌面端不在线/宿主不在时，unclaimed 行的 next_run_at 会被刷新保活到这个上限，防 misfire 终结
+const DISPATCH_KEEPALIVE_MS = 15 * 60 * 1000;
+const DISPATCH_KEEPALIVE_STEP_MS = 30 * 1000;
 
 // ---------------------------------------------------------------- 基础设施
 
@@ -111,6 +129,23 @@ function projectIdFromDirectory(directory) {
   return "proj_" + (slugify(directory).slice(0, 80) || "default");
 }
 
+function canonicalWorkspacePath(p) {
+  // 客户端对 workspaceKey 零归一化（原样透传），这里产出与桌面端一致的原生分隔符绝对路径
+  const r = resolve(String(p || ""));
+  return WIN32 ? r.replace(/\//g, "\\") : r;
+}
+
+function detectClientSessionVersion(db) {
+  // session.version 是核心运行时建会话时的版本章（zcode.cjs 版本常量，当前 0.17.0）。
+  // 新版桌面端不再覆写外部插入行，"库内最新非零版本" = 当前在跑客户端的真实写法。
+  try {
+    const r = db.prepare(
+      "SELECT version FROM session WHERE version IS NOT NULL AND version <> '' AND version <> '0.0.0' ORDER BY time_created DESC LIMIT 1"
+    ).get();
+    return r && r.version ? String(r.version) : null;
+  } catch { return null; }
+}
+
 function titleFromInput(input) {
   const compact = String(input || "").trim().replace(/\s+/g, " ");
   if (!compact) return "Untitled session";
@@ -119,7 +154,7 @@ function titleFromInput(input) {
 
 function newSessionId() { return `sess_${randomUUID()}`; }
 
-const SESSION_ID_RE = /^sess_[A-Za-z0-9._-]+$/;
+const SESSION_ID_RE = /^(?:sess|session)_[A-Za-z0-9._-]+$/; // sess_*=旧版/子代理/MCP 直建；session_<32hex>=新版客户端原生会话
 
 // ---------------------------------------------------------------- session.json 配置（可选）
 
@@ -135,7 +170,8 @@ function loadConfig() {
 function configTemplate() {
   return {
     version: 1,
-    note: "zcode-session-mcp 可选配置。keys: 智谱 coding plan 额度查询凭据（alias -> {apiKey, plan, current}）；providerMap: tasks.model 的 provider 前缀 -> keyAlias。不需要额度查询可整文件删除。",
+    note: "zcode-session-mcp 可选配置。quotaFace: true 开启额度面工具（plan_*，默认禁用）；keys: 智谱 coding plan 额度查询凭据（alias -> {apiKey, plan, current}）；providerMap: tasks.model 的 provider 前缀 -> keyAlias。不需要额度查询可整文件删除。",
+    quotaFace: false,
     keys: {},
     providerMap: {},
   };
@@ -226,30 +262,45 @@ function taskRow(dbt, sessionId) {
 }
 
 function ensureTaskRow(dbt, sessionId, { title, directory }) {
-  // 无行先收编（CLI/手工建的会话默认不在侧栏）——字段形状照抄桌面端现有行，前端渲染依赖 meta_json
+  // 无行先收编（CLI/手工建的会话默认不在侧栏）——字段形状照抄桌面端现有行，前端渲染依赖 meta_json。
+  // 必须一次写出"现代形状"（host_id/root_path/cli_*）：新版客户端 host 侧按 (workspace_key,task_id) 校验
+  // host_id==='local'，不等直接 project.host-mismatch 拒派；客户端只在宿主启动时回填 NULL 行，运行中新建的行等不到。
   const nowMs = Date.now();
   const existing = taskRow(dbt, sessionId);
   if (existing) return existing;
+  const dirNative = canonicalWorkspacePath(directory); // workspace_key 须与桌面端同形，否则侧栏分组查不到
   const last = dbt.prepare("SELECT provider, model FROM tasks WHERE provider IS NOT NULL ORDER BY updated_at DESC LIMIT 1").get() || {};
   const provider = last.provider || "glm";
   const model = last.model || null;
-  const meta = JSON.stringify({ taskId: sessionId, traceId: randomUUID(), title: title || "", titleOverridden: false, workspacePath: directory, createdAt: nowMs, updatedAt: nowMs, mode: "build", model, thoughtLevel: "max", provider, status: "idle", target: null });
-  dbt.prepare(`INSERT OR IGNORE INTO tasks (workspace_key, workspace_path, workspace_identity, task_id, title, task_status, provider, mode, model, created_at, updated_at, unread_at, pinned, archived, deleted, title_overridden, meta_json, searchable_text, cron_automation_id, last_unread_at, off_peak_task_id)
-    VALUES (?, ?, NULL, ?, ?, 'idle', ?, 'build', ?, ?, ?, NULL, 0, 0, 0, 0, ?, ?, NULL, 0, NULL)`)
-    .run(directory, directory, sessionId, title || "", provider, model, nowMs, nowMs, meta, title || "");
+  const meta = JSON.stringify({ taskId: sessionId, traceId: randomUUID(), title: title || "", titleOverridden: false, workspacePath: dirNative, createdAt: nowMs, updatedAt: nowMs, mode: "build", model, thoughtLevel: "max", provider, status: "idle", target: null });
+  // 形状对齐 initializeLegacyTaskIdentity 回填结果：cli_title_source='default'（title_overridden=0）、cli_last_outcome=NULL（idle 不在映射内）
+  dbt.prepare(`INSERT OR IGNORE INTO tasks (workspace_key, workspace_path, workspace_identity, task_id, title, task_status, provider, mode, model, created_at, updated_at, unread_at, pinned, archived, deleted, title_overridden, meta_json, searchable_text, cron_automation_id, last_unread_at, off_peak_task_id,
+    host_id, root_path, project_id, cli_title, cli_title_source, cli_created_at, cli_updated_at, cli_last_outcome, cli_deleted, handoff_pending)
+    VALUES (?, ?, NULL, ?, ?, 'idle', ?, 'build', ?, ?, ?, NULL, 0, 0, 0, 0, ?, ?, NULL, 0, NULL,
+    'local', ?, NULL, ?, 'default', ?, ?, NULL, 0, 0)`)
+    .run(dirNative, dirNative, sessionId, title || "", provider, model, nowMs, nowMs, meta, title || "",
+      dirNative, title || "", nowMs, nowMs);
   return taskRow(dbt, sessionId);
 }
 
 function patchTaskMeta(dbt, sessionId, patch) {
-  // meta_json 深度合并（桌面端把 mode/model/status 等放 meta 里，前端渲染读它）
+  // meta_json 深度合并（桌面端把 mode/model/status 等放 meta 里，前端渲染读它）；
+  // title/status 同步 cli_* 列（对齐桌面端 rename/outcome 写法，保持行形状与客户端自建一致）
   const row = taskRow(dbt, sessionId);
   if (!row) return null;
   let meta = {};
   if (row.meta_json) { try { meta = JSON.parse(row.meta_json); } catch { meta = {}; } }
   Object.assign(meta, patch, { taskId: meta.taskId || sessionId, updatedAt: Date.now() });
   const cols = { meta_json: JSON.stringify(meta), updated_at: Date.now() };
-  if (patch.title !== undefined) { cols.title = patch.title; cols.searchable_text = patch.title; }
-  if (patch.status !== undefined) cols.task_status = patch.status;
+  if (patch.title !== undefined) {
+    cols.title = patch.title; cols.searchable_text = patch.title;
+    cols.title_overridden = 1; cols.cli_title = patch.title; cols.cli_title_source = "custom";
+    cols.handoff_pending = (Number(row.handoff_pending) || 0) | 2;
+  }
+  if (patch.status !== undefined) {
+    cols.task_status = patch.status;
+    cols.cli_last_outcome = ({ error: "error", interrupted: "interrupted", completed: "completed" })[patch.status] ?? null;
+  }
   const sets = Object.keys(cols).map((c) => `${c} = ?`).join(", ");
   dbt.prepare(`UPDATE tasks SET ${sets} WHERE task_id = ?`).run(...Object.values(cols), sessionId);
   return taskRow(dbt, sessionId);
@@ -346,7 +397,7 @@ function getSessionRow(db, sessionId) {
 }
 
 function requireSession(sessionId) {
-  if (!sessionId || !SESSION_ID_RE.test(sessionId)) return { error: errResult("BAD_ARGS", `sessionId 必填且需匹配 sess_*（收到: ${sessionId}）`) };
+  if (!sessionId || !SESSION_ID_RE.test(sessionId)) return { error: errResult("BAD_ARGS", `sessionId 必填且需匹配 sess_* / session_*（收到: ${sessionId}）`) };
   let db;
   try { db = openDbRo(DB_MAIN); } catch (e) { return { error: errResult("DB_OPEN_FAILED", errText(e)) }; }
   const row = getSessionRow(db, sessionId);
@@ -761,28 +812,31 @@ function sessionSearch(args) {
 // ---------------------------------------------------------------- session_create（增）
 
 function sessionCreate(args) {
-  const directory = String(args.directory || "").trim();
-  if (!directory || !existsSync(directory)) return errResult("BAD_ARGS", `directory 必填且必须存在（收到: ${directory}）`);
+  const directoryRaw = String(args.directory || "").trim();
+  if (!directoryRaw || !existsSync(directoryRaw)) return errResult("BAD_ARGS", `directory 必填且必须存在（收到: ${directoryRaw}）`);
+  const directory = canonicalWorkspacePath(directoryRaw); // db 落盘与侧栏 workspace_key 都用原生同形路径
   let sessionId = String(args.sessionId || "").trim() || newSessionId();
-  if (!SESSION_ID_RE.test(sessionId)) return errResult("BAD_ARGS", `sessionId 需匹配 sess_*（收到: ${sessionId}）`);
+  if (!SESSION_ID_RE.test(sessionId)) return errResult("BAD_ARGS", `sessionId 需匹配 sess_* / session_*（收到: ${sessionId}）`);
   const title = args.title ? titleFromInput(args.title) : "Untitled session";
   const titleSource = args.title ? "custom" : "first_input";
   const taskType = String(args.taskType || "interactive");
   const mode = String(args.mode || "build");
-  const version = String(args.version || "0.0.0"); // 本地老 schema version NOT NULL；0.0.0 = 未知，首跑由 runtime 覆写
   const now = Date.now();
   let modelInfo = null;
   const projectId = projectIdFromDirectory(directory);
-  const slug = slugify(sessionId);
+  const slug = sessionId; // 对齐桌面端 createSession：slug = id 原样（不再 slugify 出连字符变体）
 
   if (existsSync(DB_MAIN) === false) return errResult("DB_NOT_FOUND", `未找到 ${DB_MAIN}`);
   let db;
   try { db = openDbRw(DB_MAIN); } catch (e) { return errResult("DB_OPEN_FAILED", errText(e)); }
   try {
     if (getSessionRow(db, sessionId)) return errResult("SESSION_EXISTS", `会话已存在: ${sessionId}`, { session_id: sessionId });
+    // version 盖章对齐客户端：显式入参 > 库内最新非零版本（当前客户端真实写法） > 0.0.0 兜底
+    const version = String(args.version || "").trim() || detectClientSessionVersion(db) || "0.0.0";
     db.exec("BEGIN IMMEDIATE");
     try {
-      // INSERT 形状对齐 createSession（repositories/sessions.ts:20），version 留空（由首次运行时 runtime 补）
+      // INSERT 形状对齐 createSession（repositories/sessions.ts:20）；version 必须给真实值——
+      // 新版桌面端（3.16.x 起）对零版本会话不覆写也不收编，0.0.0 只在探测完全失败时兜底
       db.prepare(`INSERT INTO session (
         id, project_id, workspace_id, parent_id, trace_id, task_type, slug, directory, path,
         title, title_source, title_message_id, version,
@@ -1096,6 +1150,7 @@ function openTasksIndexRW() { return openDbRw(DB_TASKS, DB_TASKS_TIMEOUT_MS); }
 function nativeAutomationInsert(args) {
   // args: { prompt, cwd, targetTaskId?, mode?, title? }
   const now = Date.now();
+  const cwd = canonicalWorkspacePath(args.cwd); // 宿主按原样路由 CronRun，正斜杠路径会派错/派不进
   const automationId = "automation-" + randomUUID();
   const prefix = args.targetTaskId ? "session send" : "session run";
   const title = (args.title || (prefix + ": " + (args.prompt || "").replace(/\s+/g, " ").slice(0, 60))).slice(0, 200);
@@ -1111,7 +1166,7 @@ function nativeAutomationInsert(args) {
     }
     db.prepare(`INSERT INTO automations (
         automation_id, title, cron_expr, prompt, model, provider, model_selection,
-        workspace_key, workspace_path, workspace_identity, target_task_id, bot_delivery_target, location_kind,
+        workspace_key, workspace_path, workspace_identity, target_task_id, bot_delivery_target, location_kind, host_id,
         recurring, max_runs, end_at, schedule_rule, schedule_edited_by_user,
         run_count, enabled, lifecycle_status,
         next_run_at, last_run_at, running, claimed_at,
@@ -1119,7 +1174,7 @@ function nativeAutomationInsert(args) {
         mode, thought_level, created_at, updated_at
       ) VALUES (
         ?, ?, '*', ?, NULL, NULL, ?,
-        ?, ?, NULL, ?, NULL, 'local',
+        ?, ?, NULL, ?, NULL, 'local', 'local',
         0, 1, NULL, NULL, 0,
         0, 1, 'active',
         ?, NULL, 0, NULL,
@@ -1128,7 +1183,7 @@ function nativeAutomationInsert(args) {
       )`).run(
       automationId, title, args.prompt,
       args.modelSelectionJson || 'null', // 'null' 字面量=跟随桌面首选；JSON=本次派发的固定 ModelSelection（调度器传 resumeTask，Host 首次有效选择即固定）
-      args.cwd, args.cwd, args.targetTaskId || null,
+      cwd, cwd, args.targetTaskId || null,
       now - 200, // ≈now：必须落在 misfire 宽限（5 分钟）内
       args.mode || "yolo", now, now,
     );
@@ -1139,9 +1194,11 @@ function nativeAutomationInsert(args) {
 }
 
 async function nativeDispatchWait(automationId, args) {
-  const claimTimeoutMs = Math.min(Math.max(Number(args.claimTimeoutMs) || 90000, 15000), 300000);
+  const claimTimeoutMs = Math.min(Math.max(Number(args.claimTimeoutMs) || 90000, 15000), 1800000);
   const sessionTimeoutMs = Math.min(Math.max(Number(args.sessionTimeoutMs) || 120000, 15000), 600000);
   const startedAt = Date.now();
+  const keepaliveDeadline = startedAt + DISPATCH_KEEPALIVE_MS;
+  let lastRefresh = 0;
   const s3 = () => new Promise((r) => setTimeout(r, 3000));
   const readRow = () => {
     let db;
@@ -1161,12 +1218,30 @@ async function nativeDispatchWait(automationId, args) {
     const r = last.row;
     if (last.error) return { ok: false, error: { code: "AUTOMATION_POLL_FAILED", message: last.error }, automationId };
     if (!r) return { ok: false, error: { code: "AUTOMATION_VANISHED", message: "插入的 automation 行消失了（可能被桌面端清理）" }, automationId };
+    if (last.run && last.run.dispatch_status === "skipped") {
+      return { ok: false, automationId, dispatchStatus: "skipped", misfired: true,
+        error: { code: "MISFIRE_SKIPPED", message: `调度器按 misfire 终结了本次注入（${last.run.error || "computer_asleep_or_app_not_running"}：5 分钟派发窗口内桌面端不在线/无可用 workspace 宿主）。一次性行已终结；确认桌面端在跑且目标 workspace 已打开后重发即可。` } };
+    }
     if (r.running === 1 || r.dispatch_status !== "idle" || r.last_error || r.retry_at) { claimed = true; break; }
+    // keepalive：桌面端不在线/宿主未起时，把 unclaimed 行的 next_run_at 保持在 misfire 宽限内，
+    // 等桌面端回来仍会被正常认领（有 keepalive 上限，不造永生行）
+    const nowTs = Date.now();
+    if (nowTs < keepaliveDeadline && nowTs - lastRefresh >= DISPATCH_KEEPALIVE_STEP_MS
+        && r.enabled === 1 && r.next_run_at != null && nowTs - Number(r.next_run_at) > MISFIRE_GRACE_MS / 2) {
+      try {
+        const dbw = openTasksIndexRW();
+        try {
+          dbw.prepare("UPDATE automations SET next_run_at = ?, updated_at = ? WHERE automation_id = ? AND running = 0 AND dispatch_status = 'idle' AND enabled = 1")
+            .run(nowTs - 200, nowTs, automationId);
+        } finally { dbw.close(); }
+        lastRefresh = nowTs;
+      } catch { /* 下一轮再试 */ }
+    }
     await s3();
   }
   if (!claimed) {
     return { ok: false, pending: true, automationId, dispatchStatus: last.row.dispatch_status,
-      error: { code: "CLAIM_TIMEOUT", message: `等待 ${claimTimeoutMs}ms 调度器未认领（desktop scheduler 每 ${SCHEDULER_POLL_MS / 1000}s 轮询一次；若桌面端已退出则该一次性任务会在下次启动时按 misfire 跳过，不留尾巴）` } };
+      error: { code: "CLAIM_TIMEOUT", message: `等待 ${claimTimeoutMs}ms 调度器未认领（desktop scheduler 每 ${SCHEDULER_POLL_MS / 1000}s 轮询；本 MCP 已做 ${Math.round(DISPATCH_KEEPALIVE_MS / 60000)} 分钟 misfire 保活，超时放弃后行会随下一次调度器清扫按 misfire 终结）。` } };
   }
   const row1 = last.row;
   if (row1.last_error && !row1.running) {
@@ -1179,6 +1254,10 @@ async function nativeDispatchWait(automationId, args) {
     last = readRow();
     if (last.error) return { ok: false, error: { code: "AUTOMATION_POLL_FAILED", message: last.error }, automationId };
     if (last.run && last.run.session_id) { runRow = last.run; break; }
+    if (last.run && last.run.dispatch_status === "skipped") {
+      return { ok: false, automationId, dispatchStatus: "skipped", misfired: true,
+        error: { code: "MISFIRE_SKIPPED", message: `认领后宿主未应答，重认领时已出 misfire 宽限，调度器终结了本次注入（${last.run.error || "computer_asleep_or_app_not_running"}）。确认目标 workspace 在桌面端打开后重发即可。` } };
+    }
     if (last.row.last_error && last.row.dispatch_status !== "claimed" && !last.row.running) {
       return { ok: false, automationId, dispatchStatus: last.row.dispatch_status, lastError: last.row.last_error,
         error: { code: "DISPATCH_FAILED", message: "派发失败：" + last.row.last_error } };
@@ -1251,9 +1330,10 @@ async function bgRun(jobPath) {
   let job = null, result;
   try {
     job = JSON.parse(readFileSync(jobPath, "utf8"));
+    // 受理即返回的后台作业：认领等待默认拉到 keepalive 上限（桌面端当时不在线也保活到 15 分钟再放弃）
     result = job.kind === "send"
-      ? await sessionSend({ ...job.args, wait: true })
-      : await sessionRun({ ...job.args, wait: true });
+      ? await sessionSend({ claimTimeoutMs: DISPATCH_KEEPALIVE_MS, ...job.args, wait: true })
+      : await sessionRun({ claimTimeoutMs: DISPATCH_KEEPALIVE_MS, ...job.args, wait: true });
   } catch (e) { result = errResult("BG_RUN_FAILED", errText(e)); }
   const resultPath = jobPath.replace(/\.job\.json$/, ".result.json");
   try { writeFileSync(resultPath, JSON.stringify(result, null, 2), "utf8"); } catch (e) { log("后台写结果失败:", errText(e)); }
@@ -1424,7 +1504,7 @@ async function sessionSend(args) {
     return okResult({
       ok: true, accepted: true, async: true, mode, sessionId,
       jobId: jb.jobId, resultPath: jb.resultPath,
-      note: "原生注入已受理（后台插 automations 行并等调度器认领派发）。复核：Read resultPath；侧栏该会话会实时显示运行状态。",
+      note: "原生注入已受理（后台插 automations 行并等调度器认领派发，含 15 分钟 misfire 保活——桌面端当时不在线也会等它回来）。复核：Read resultPath；侧栏该会话会实时显示运行状态。",
     });
   }
   const result = await nativeDispatch({ prompt, targetTaskId: sessionId, cwd: directory, modelSelectionJson, claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
@@ -1449,7 +1529,7 @@ async function sessionRun(args) {
     return okResult({
       ok: true, accepted: true, async: true, native: true,
       jobId: jb.jobId, resultPath: jb.resultPath,
-      note: "原生 spawn 已受理（后台插 automations 行并等调度器认领）。复核：Read resultPath 拿 sessionId（一般 ≤20s 认领 + 数秒建会话）；桌面侧栏会实时出现该会话并显示运行状态。结果文件生成前绝不重发。",
+      note: "原生 spawn 已受理（后台插 automations 行并等调度器认领，含 15 分钟 misfire 保活）。复核：Read resultPath 拿 sessionId（一般 ≤20s 认领 + 数秒建会话）；桌面侧栏会实时出现该会话并显示运行状态。结果文件生成前绝不重发。",
     });
   }
   return nativeDispatch({ prompt, cwd: args.cwd, mode: "yolo", claimTimeoutMs: args.claimTimeoutMs, sessionTimeoutMs: args.sessionTimeoutMs });
@@ -2090,7 +2170,7 @@ const TOOLS = [
     description: "会话详情：核心字段、消息统计、模型选择真源(session_entry)、token 用量(turn/model_usage)、todo、运行目标心跳、子会话、后台代理、model-io/artifacts 文件、侧栏组织态、在飞启发式。Full detail of one session.",
     inputSchema: {
       type: "object",
-      properties: { sessionId: { type: "string", description: "sess_* 会话 id" } },
+      properties: { sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" } },
       required: ["sessionId"],
     },
   },
@@ -2100,7 +2180,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         limit: { type: "number", description: "条数，默认20，上限200" },
         offset: { type: "number", description: "从末尾往前跳过条数（tail 模式分页用）" },
         tail: { type: "boolean", description: "默认 true=取最新段；false=从头取" },
@@ -2117,7 +2197,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         format: { type: "string", enum: ["jsonl", "txt"], description: "jsonl=结构化原样（默认）；txt=普通对话式" },
         chunk: { type: "boolean", description: "是否切片，默认 true；false=单文件" },
         chunkTokens: { type: "number", description: "每片估算 token 上限，默认 100000" },
@@ -2149,7 +2229,7 @@ const TOOLS = [
       properties: {
         directory: { type: "string", description: "工作目录（必须已存在）" },
         title: { type: "string", description: "标题；缺省 'Untitled session'，给标题则 title_source=custom" },
-        sessionId: { type: "string", description: "可选自定义 sess_* id，缺省自动生成" },
+        sessionId: { type: "string", description: "可选自定义 id（sess_* 或 session_*），缺省自动生成" },
         parentId: { type: "string", description: "可选父会话（fork 语义）" },
         modelRef: { type: "string", description: "可选；预设模型 providerId/modelId 或模型 id 片段" },
         thoughtLevel: { type: "string", description: "推理档位，默认 high" },
@@ -2165,7 +2245,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         title: { type: "string", description: "新标题（超60字符自动截断对齐客户端）" },
       },
       required: ["sessionId", "title"],
@@ -2177,7 +2257,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         pinned: { type: "boolean", description: "默认 true" },
       },
       required: ["sessionId"],
@@ -2189,7 +2269,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         archived: { type: "boolean", description: "默认 true" },
       },
       required: ["sessionId"],
@@ -2201,7 +2281,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         hard: { type: "boolean", description: "true=永久删除（默认 false 软删）" },
         confirm: { type: "boolean", description: "hard=true 时必填 true；会话疑似在飞时软删也需要" },
         files: { type: "boolean", description: "hard 时连 artifacts/agents 目录一起清" },
@@ -2214,7 +2294,7 @@ const TOOLS = [
     description: "会话在飞状态：cli/agents 后台代理 + 子会话(parent_id) + 近10分钟消息判活 + tasks-index 对照。Liveness & background agents of a session.",
     inputSchema: {
       type: "object",
-      properties: { sessionId: { type: "string", description: "sess_* 会话 id" } },
+      properties: { sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" } },
       required: ["sessionId"],
     },
   },
@@ -2239,7 +2319,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "目标会话 id (sess_*)" },
+        sessionId: { type: "string", description: "目标会话 id（sess_* 或 session_*）" },
         prompt: { type: "string", description: "要注入的提示词" },
         mode: { type: "string", enum: ["append", "interrupt"], description: "默认 append 排队；interrupt=断开式注入（在飞时断宿主中止当前回合再注入）" },
         force: { type: "boolean", description: "interrupt 时确认连带中断同 workspace 其他会话" },
@@ -2258,7 +2338,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "sess_* 会话 id" },
+        sessionId: { type: "string", description: "会话 id（sess_* 或 session_*）" },
         modelRef: { type: "string", description: "providerId/modelId 全称或模型 id 片段（如 GLM-5.2）" },
         thoughtLevel: { type: "string", description: "推理档位，默认 high" },
       },
@@ -2369,6 +2449,11 @@ const TOOLS = [
 ];
 
 function dispatch(name, args) {
+  if (QUOTA_TOOLS.has(name) && !quotaFaceEnabled()) {
+    return Promise.resolve(errResult("QUOTA_FACE_DISABLED",
+      `额度面（${name}）默认禁用（v0.6.0 起）：额度归因不了具体会话（会话绑定 providerId 而非 keyAlias），且凭据/人机验证维护成本高。确需开启：设环境变量 ZCODE_SESSION_QUOTA_FACE=1，或在 session.json 加 "quotaFace": true。`,
+      { tool: name }));
+  }
   switch (name) {
     case "session_list": return Promise.resolve(listSessions(args || {}));
     case "session_get": return Promise.resolve(sessionGet(args || {}));
@@ -2439,7 +2524,7 @@ if (process.argv[2] === "--background-run" && process.argv[3]) {
         case "ping":
           return reply({});
         case "tools/list":
-          return reply({ tools: TOOLS });
+          return reply({ tools: TOOLS.filter((t) => !QUOTA_TOOLS.has(t.name) || quotaFaceEnabled()) });
         case "tools/call": {
           const name = params && params.name;
           const toolArgs = (params && params.arguments) || {};

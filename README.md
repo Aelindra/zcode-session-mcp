@@ -88,7 +88,9 @@ Then register with your MCP client.
 | `session_run` | Start a **new** session with a prompt. Inserts a one-shot row into the desktop scheduler's automations table; the ZCode app (20s polling) picks it up and runs it natively — the session appears live in the sidebar. Returns immediately with a `resultPath` you can read later. |
 | `session_send` | Inject a prompt into an **existing** session via the native channel (desktop `resumeTask`+`sendPrompt`; queues natively while the session is busy). `mode=append` queues; `mode=interrupt` aborts-and-injects: queues the automation row first, then kills the workspace's app-server host (CPU-probe identified) to cut the running turn — the scheduler (main process, survives the kill) reopens the host in ≤20s and delivers the new prompt. Other in-flight sessions in the same workspace die with it unless `force: true`; if the caller lives in the same workspace its connection drops too — verify via `resultPath`. `modelRef` (`providerId/modelId` + optional `thoughtLevel`) pins the model **for this dispatch** on the automation row itself — race-free vs the desktop rewriting session-level selections; use it to switch keys/providers per injection. `session_model` remains the session-level persistent choice. |
 
-### 额度面（Quota / plan）
+### 额度面（Quota / plan）— **optional, disabled by default**（v0.6.0 起）
+
+The five `plan_*` tools are **hidden from `tools/list` and rejected with `QUOTA_FACE_DISABLED` unless enabled** — a session binds to a `providerId`, not to an API key alias, so quota results can't be attributed to sessions anyway, and the credentials/captcha upkeep outweighs the value. Enable with env `ZCODE_SESSION_QUOTA_FACE=1` or `"quotaFace": true` in `session.json`.
 
 | Tool | What it does |
 | --- | --- |
@@ -130,6 +132,7 @@ Routing note for model refs (`session_send.modelRef` / `session_model`): custom 
 | `ZCODE_SESSION_NODE` | `process.execPath` | Node executable for background job children (>= 22.5). |
 | `ZCODE_SESSION_QUOTA_BASE` | Zhipu endpoint | Quota API base. |
 | `ZCODE_SESSION_PLAN_BASE` | `https://zcode.z.ai` | start plan / reset card API base. |
+| `ZCODE_SESSION_QUOTA_FACE` | *(unset = disabled)* | Set to `1` to expose the five `plan_*` quota tools (also enabled by `"quotaFace": true` in `session.json`). |
 | `ZCODE_SESSION_APP_VERSION` | `3.14.4` | `app_version` sent to zcode.z.ai (server validates it — keep in sync with the client). |
 | `ZCODE_CREDENTIAL_SECRET` | fallback string | Only if the desktop was launched with a custom credential secret. |
 
@@ -140,6 +143,16 @@ This is the renamed, expanded successor of `zcode-fleet-mcp` (a cross-session "f
 **v0.3.0** — the zcode CLI headless channel (`ZCODE_SESSION_CLI` / `native: false`) was removed entirely. `session_run` / `session_send` now go through the desktop scheduler's native channel only (real `createTask`/`resumeTask`+`sendPrompt`, live sidebar status, per-model injection via `session_model`).
 
 **v0.4.0** — new `session_export` tool (structured raw JSONL / plain conversational txt, optional ~100k-token chunking). `plan_reset_card` now returns per-card `expire_at` in `status`, and its docs make the desktop-login requirement explicit (API keys cannot query or switch accounts).
+
+**v0.5.1** — desktop 3.16.x compatibility (externally created sessions became invisible and dispatch was silently killed):
+
+- `session_create` stamps `session.version` with the client's real core version (detected from the newest non-zero row in `db.sqlite`) instead of `0.0.0`.
+- Task-index rows are now written fully-formed in the modern shape (`host_id='local'`, `root_path`, `cli_*` columns). The new desktop host validates `host_id==='local'` per `(workspace_key, task_id)` on every dispatch and rejects otherwise with `project.host-mismatch`; it only backfills `NULL` rows at host startup, so rows created while the app is running never become dispatchable without this.
+- Workspace paths are canonicalized to native separators (Windows backslashes). The client's `resolveWorkspaceKey` does zero normalization — forward-slash paths landed under a different `workspace_key`, so the sidebar grouping and the dispatch router never matched.
+- Session ids in both formats are accepted (`sess_*` legacy/MCP and `session_<hex>` native).
+- One-shot dispatches keep their `next_run_at` inside the scheduler's 5-minute misfire window while unclaimed (15-minute keepalive for fire-and-forget jobs), and a scheduler misfire skip (`computer_asleep_or_app_not_running`) is now reported as `MISFIRE_SKIPPED` instead of surfacing as a generic claim timeout.
+
+**v0.6.0** — the quota face (`plan_quota` / `plan_start` / `plan_reset_card` / `plan_claim` / `plan_switch`) is now **optional and disabled by default**: the five tools disappear from `tools/list` and calls return `QUOTA_FACE_DISABLED` unless enabled via `ZCODE_SESSION_QUOTA_FACE=1` or `session.json "quotaFace": true`. Rationale: sessions bind to a `providerId` (e.g. `account:bigmodel-start-plan/GLM-5.3-Flash`), not to a `keyAlias`, so quota numbers can't be attributed to any session — and key/captcha upkeep isn't worth an opt-in face that mostly duplicates what the desktop client already shows.
 
 ## Disclaimer
 

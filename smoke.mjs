@@ -16,8 +16,8 @@ let buf = "";
 let nextId = 1;
 const pending = new Map();
 
-function start() {
-  proc = spawn(NODE_EXE, [SERVER], { stdio: ["pipe", "pipe", "pipe"] });
+function start(extraEnv = {}) {
+  proc = spawn(NODE_EXE, [SERVER], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...extraEnv } });
   proc.stderr.on("data", (d) => process.stderr.write("[server] " + d));
   proc.stdout.setEncoding("utf8");
   proc.stdout.on("data", (chunk) => {
@@ -59,7 +59,21 @@ function check(label, cond, detail) {
 
 async function main() {
   mkdirSync(TEST_DIR, { recursive: true });
-  start();
+
+  // ---- 阶段 A：默认（额度面禁用）模式——plan_* 不暴露、调用报 QUOTA_FACE_DISABLED
+  start({});
+  await new Promise((r) => setTimeout(r, 800));
+  await rpc("initialize", { protocolVersion: "2024-11-05" });
+  const tlA = await rpc("tools/list", {});
+  const namesA = tlA.result.tools.map((t) => t.name);
+  check("禁用模式 tools/list 无 plan_*（18个）", namesA.filter((n) => n.startsWith("plan_")).length === 0 && namesA.length === 18, namesA);
+  const qd = await call("plan_quota", {});
+  check("禁用模式 plan_quota 报 QUOTA_FACE_DISABLED", qd.isError && qd.body && qd.body.error && qd.body.error.code === "QUOTA_FACE_DISABLED", qd.body);
+  proc.kill();
+  await new Promise((r) => setTimeout(r, 400));
+
+  // ---- 阶段 B：开启额度面（env 开关）——全工具面回归
+  start({ ZCODE_SESSION_QUOTA_FACE: "1" });
   await new Promise((r) => setTimeout(r, 800));
 
   const init = await rpc("initialize", { protocolVersion: "2024-11-05" });
@@ -67,7 +81,7 @@ async function main() {
 
   const tl = await rpc("tools/list", {});
   const names = tl.result.tools.map((t) => t.name);
-  check("tools/list 18个", names.length === 18, names);
+  check("tools/list 23个", names.length === 23, names);
 
   // ---- 只读面（真实数据）
   const list = await call("session_list", { limit: 5 });
